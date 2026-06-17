@@ -8,9 +8,12 @@ import mimetypes
 import threading
 import time
 
+from snn_backend import PongSNN
+
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
+NETWORK_SAVE_ROOT = ROOT / "network_saves"
 
 SETTINGS = {
     "width": 800,
@@ -27,7 +30,7 @@ STATE = {
     "sessionId": "local-1",
     "resetToken": 0,
     "seed": int(time.time() * 1000) & 0xFFFFFFFF,
-    "mode": "human",
+    "mode": "api",
     "apiDirection": 0,
     "authoritativeTick": 0,
     "eventSeq": 0,
@@ -51,6 +54,7 @@ STATE = {
 }
 
 STATE_LOCK = threading.Lock()
+SNN = PongSNN(SETTINGS["width"], SETTINGS["height"], save_dir=NETWORK_SAVE_ROOT)
 
 
 def parse_direction(value):
@@ -98,6 +102,12 @@ def session_payload():
         "latestEventSeq": STATE["eventSeq"],
         "latestInputSeq": STATE["inputSeq"],
         "settings": SETTINGS,
+        "snn": {
+            "training": SNN.training,
+            "paused": SNN.paused,
+            "winner": SNN.activity["winner"],
+            "direction": SNN.activity["direction"],
+        },
     }
 
 
@@ -168,6 +178,27 @@ def add_session_event(body, default_type="input"):
     STATE["updatedAt"] = time.time()
     compact_events()
     return event
+
+
+def apply_snn_to_state():
+    if not STATE.get("eventCamera"):
+        return None
+    if not SNN.training or SNN.paused:
+        return None
+    direction = SNN.step(STATE["eventCamera"], STATE["authoritativeTick"])
+    if direction is None:
+        return None
+    if not SNN.should_emit_command(direction, STATE["authoritativeTick"]):
+        return None
+    return add_session_event(
+        {
+            "type": "input",
+            "tick": STATE["authoritativeTick"] + 1,
+            "direction": direction,
+            "source": "api",
+        },
+        "input",
+    )
 
 
 def reset_game_state(reset_score=True):
@@ -253,6 +284,16 @@ class PongHandler(BaseHTTPRequestHandler):
                 payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS}
             self.send_json(payload)
             return
+        if path == "/api/snn/status":
+            with STATE_LOCK:
+                payload = SNN.status()
+            self.send_json(payload)
+            return
+        if path == "/api/snn/saves":
+            with STATE_LOCK:
+                payload = {"saves": SNN.list_saves()}
+            self.send_json(payload)
+            return
         if path.startswith("/web/"):
             requested = (WEB_ROOT / unquote(path.removeprefix("/web/"))).resolve()
             if WEB_ROOT in requested.parents or requested == WEB_ROOT:
@@ -281,6 +322,21 @@ class PongHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/reset":
                 self.reset_game(body)
+                return
+            if path == "/api/snn/start":
+                self.start_snn(body)
+                return
+            if path == "/api/snn/pause":
+                self.pause_snn(body)
+                return
+            if path == "/api/snn/reset":
+                self.reset_snn(body)
+                return
+            if path == "/api/snn/save":
+                self.save_snn(body)
+                return
+            if path == "/api/snn/load":
+                self.load_snn(body)
                 return
             self.send_error(404, "Not found")
         except ValueError as exc:
@@ -343,15 +399,64 @@ class PongHandler(BaseHTTPRequestHandler):
                 STATE["eventCamera"] = normalize_event_camera(body["eventCamera"])
             if isinstance(body.get("source"), str):
                 STATE["source"] = body["source"]
+            snn_event = apply_snn_to_state()
             STATE["updatedAt"] = time.time()
             compact_events()
-            payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS}
+            payload = {
+                **copy.deepcopy(STATE),
+                "tick": STATE["authoritativeTick"],
+                "settings": SETTINGS,
+                "snnEvent": copy.deepcopy(snn_event),
+            }
         self.send_json(payload)
 
     def reset_game(self, body):
         with STATE_LOCK:
             reset_game_state(body.get("resetScore", True) is not False)
             payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS}
+        self.send_json(payload)
+
+    def start_snn(self, body):
+        with STATE_LOCK:
+            STATE["mode"] = "api"
+            SNN.start()
+            start_event = add_session_event(
+                {"type": "start", "tick": parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)},
+                "start",
+            )
+            payload = {**session_payload(), "event": copy.deepcopy(start_event), "snn": SNN.status()}
+        self.send_json(payload)
+
+    def pause_snn(self, body):
+        with STATE_LOCK:
+            SNN.pause()
+            pause_event = add_session_event(
+                {"type": "pause", "tick": parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)},
+                "pause",
+            )
+            payload = {**session_payload(), "event": copy.deepcopy(pause_event), "snn": SNN.status()}
+        self.send_json(payload)
+
+    def reset_snn(self, body):
+        with STATE_LOCK:
+            SNN.reset(reset_weights=body.get("resetWeights", True) is not False)
+            reset_game_state(body.get("resetScore", True) is not False)
+            payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS, "snn": SNN.status()}
+        self.send_json(payload)
+
+    def save_snn(self, body):
+        with STATE_LOCK:
+            name = SNN.save(body.get("name"))
+            payload = {"saved": name, "saves": SNN.list_saves(), "snn": SNN.status()}
+        self.send_json(payload)
+
+    def load_snn(self, body):
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("name is required")
+        with STATE_LOCK:
+            loaded = SNN.load(name)
+            payload = {"loaded": loaded, "saves": SNN.list_saves(), "snn": SNN.status()}
         self.send_json(payload)
 
     def serve_file(self, path):

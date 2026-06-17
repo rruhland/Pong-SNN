@@ -9,18 +9,60 @@
 <body>
   <main class="visualizer">
     <aside class="controls">
+      <div class="output-stack" aria-label="SNN output activity">
+        <div class="output-meter" data-output="up">
+          <span>Up</span>
+          <div class="meter-track"><div id="barUp" class="meter-fill"></div></div>
+        </div>
+        <div class="output-meter" data-output="down">
+          <span>Down</span>
+          <div class="meter-track"><div id="barDown" class="meter-fill"></div></div>
+        </div>
+        <div class="output-meter" data-output="stay">
+          <span>Nothing</span>
+          <div class="meter-track"><div id="barStay" class="meter-fill"></div></div>
+        </div>
+      </div>
+      <div class="button-row">
+        <button id="start" type="button">start</button>
+        <button id="pause" type="button">pause</button>
+      </div>
       <button id="reset" type="button">reset</button>
+      <div class="button-row">
+        <button id="saveNetwork" type="button">save-network</button>
+        <button id="loadNetwork" type="button">load-network</button>
+      </div>
+      <select id="savedNetworks" aria-label="Saved networks"></select>
       <label class="trail-control" for="trailMs">
         <span>trail</span>
         <input id="trailMs" type="range" min="0" max="500" step="10" value="120">
         <output id="trailValue" for="trailMs">120ms</output>
       </label>
+      <div class="backend-readout">
+        <span id="device">backend: waiting</span>
+        <span id="trainState">paused</span>
+      </div>
     </aside>
     <section class="game-panel">
+      <h1>Pong Screen</h1>
       <canvas id="preview" aria-label="Pong state preview"></canvas>
     </section>
-    <section class="score" aria-label="Score">
-      <span id="score">0:0</span>
+    <section class="bottom-panel" aria-label="SNN status">
+      <div class="score">
+        <span>Score:</span>
+        <span id="score">0:0</span>
+      </div>
+      <div class="winner">
+        <span id="winner">stay put</span>
+      </div>
+      <div class="spike-stats">
+        <span id="eventCount">events 0</span>
+        <span id="spikeCounts">spikes 0 / 0 / 0</span>
+        <span id="stdpCounts">stdp +0 / -0</span>
+      </div>
+    </section>
+    <section class="network-panel" aria-label="Network design">
+      <canvas id="networkDesign" aria-label="Sparse SNN architecture and activity"></canvas>
     </section>
   </main>
   <script src="/web/pong-core.js"></script>

@@ -1,9 +1,10 @@
 ﻿# Pong-SNN
 
-A minimal local Pong surface for later SNN/event-camera experiments.
+A minimal local Pong surface with a backend-owned sparse SNN trainer.
 
-The browser shows only the Pong game. Score, control mode, and computer inputs
-are handled through the local backend API.
+The browser game renders Pong and publishes a virtual event-camera frame. The
+Python backend owns the SNN, consumes those event-camera spikes, applies basic
+STDP, and sends `up`, `down`, or `stay` paddle commands back through the API.
 
 ## Run
 
@@ -11,10 +12,10 @@ are handled through the local backend API.
 python server.py
 ```
 
-If Python is not on PATH, run the equivalent dependency-free Node server:
+If Python is not on PATH in this Codex environment, the bundled runtime works:
 
 ```powershell
-node server.js
+C:\Users\rruhl\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe server.py
 ```
 
 Open http://127.0.0.1:8000 and press any key to start.
@@ -34,9 +35,37 @@ state in real time.
 
 Each published game frame now includes `eventCamera`, a game-side virtual event
 camera payload. `eventCamera.pixels` is a list of changed logical game-pixel
-indices, encoded as `y * eventCamera.width + x`. The visualizer draws those
-events as opaque red pixels over the mirrored Pong view; it does not sample its
-own canvas to generate events.
+indices, encoded as `y * eventCamera.width + x`. The backend SNN treats every
+Pong pixel as a possible input neuron, while only those event pixels spike on a
+given frame. The visualizer draws those events as an overlay; it does not sample
+its own canvas to generate events or train the model.
+
+## Backend SNN
+
+The current SNN is intentionally basic:
+
+- Input: `800 x 450` event-camera pixels.
+- Hidden layer 1: `80 x 45`, one sparse chunk neuron per `10 x 10` pixel area.
+- Hidden layer 2: `40 x 23`, sparse `3 x 3` neighborhoods over hidden layer 1.
+- Hidden layer 3: `20 x 12`, sparse `5 x 5` neighborhoods over hidden layer 2.
+- Output: `move up`, `move down`, `stay put`.
+
+Training is local STDP only in this first pass. Active pre plus active post
+potentiates a connection; active pre without a post spike depresses it slightly.
+The code has a backend device descriptor and checks for Torch/CUDA, but the
+dependency-free path runs on CPU when Torch is unavailable.
+
+SNN controls:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/snn/start
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/snn/pause
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/snn/reset -ContentType "application/json" -Body '{"resetWeights":true,"resetScore":true}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/snn/save -ContentType "application/json" -Body '{"name":"pong-snn"}'
+Invoke-RestMethod http://127.0.0.1:8000/api/snn/status
+```
+
+Saved networks are JSON files under `network_saves/`.
 
 ## Controls
 
@@ -114,6 +143,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/reset -ContentType
 
 ```powershell
 node tests/sync_smoke.js
+C:\Users\rruhl\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe tests\snn_smoke.py
 ```
 
 The smoke test runs the game and visualizer scripts in separate browser-like

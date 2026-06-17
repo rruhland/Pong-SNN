@@ -6,7 +6,7 @@ const client = {
   eventCamera: PongCore.createEventCamera(),
   accumulator: 0,
   lastTime: performance.now(),
-  mode: "human",
+  mode: "api",
   resetToken: null,
   sessionId: null,
   seed: null,

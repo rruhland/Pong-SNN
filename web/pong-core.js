@@ -86,6 +86,8 @@
       }
       if (type === "start") {
         start(sim);
+      } else if (type === "pause") {
+        sim.running = false;
       } else if (type === "input") {
         sim.inputDirection = clamp(Number(event.direction) || 0, -1, 1);
         sim.appliedInputIds.add(eventId);
