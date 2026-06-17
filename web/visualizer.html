@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pong Visualizer</title>
+  <link rel="stylesheet" href="/web/visualizer.css">
+</head>
+<body>
+  <main class="visualizer">
+    <aside class="controls">
+      <button id="reset" type="button">reset</button>
+    </aside>
+    <section class="game-panel">
+      <canvas id="preview" aria-label="Pong state preview"></canvas>
+    </section>
+    <section class="score" aria-label="Score">
+      <span id="score">0:0</span>
+    </section>
+  </main>
+  <script src="/web/pong-core.js"></script>
+  <script src="/web/visualizer.js"></script>
+</body>
+</html>
