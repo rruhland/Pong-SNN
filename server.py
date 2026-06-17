@@ -257,10 +257,11 @@ class PongHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/inputs":
             query = parse_qs(parsed.query)
+            has_since_seq = "sinceSeq" in query
             since_seq = int(query.get("sinceSeq", ["0"])[0])
             since_tick = int(query.get("sinceTick", ["-1"])[0])
             with STATE_LOCK:
-                if since_seq > 0:
+                if has_since_seq:
                     events = [event for event in STATE["inputEvents"] if event["seq"] > since_seq]
                 else:
                     events = [event for event in STATE["inputEvents"] if event["tick"] > since_tick]
@@ -269,10 +270,11 @@ class PongHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/events":
             query = parse_qs(parsed.query)
+            has_since_seq = "sinceSeq" in query
             since_seq = int(query.get("sinceSeq", ["0"])[0])
             since_tick = int(query.get("sinceTick", ["-1"])[0])
             with STATE_LOCK:
-                if since_seq > 0:
+                if has_since_seq:
                     events = [event for event in STATE["events"] if event["seq"] > since_seq]
                 else:
                     events = [event for event in STATE["events"] if event["tick"] > since_tick]

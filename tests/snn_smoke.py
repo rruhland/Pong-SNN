@@ -32,6 +32,8 @@ def main():
         started = request_json(base_url, "/api/snn/start", {})
         assert started["snn"]["training"] is True
         assert started["snn"]["paused"] is False
+        startup_events = request_json(base_url, "/api/events?sinceSeq=0&sinceTick=9999")
+        assert any(event["type"] == "start" for event in startup_events["events"])
         state = request_json(
             base_url,
             "/api/state",

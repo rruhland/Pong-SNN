@@ -357,10 +357,11 @@ function handleRequest(request, response) {
     return;
   }
   if (route === "/api/inputs") {
+    const hasSinceSeq = url.searchParams.has("sinceSeq");
     const sinceSeq = Number.parseInt(url.searchParams.get("sinceSeq") || "0", 10);
     const sinceTick = Number.parseInt(url.searchParams.get("sinceTick") || "-1", 10);
     const events = state.inputEvents.filter((event) => {
-      if (Number.isFinite(sinceSeq) && sinceSeq > 0) {
+      if (hasSinceSeq && Number.isFinite(sinceSeq)) {
         return event.seq > sinceSeq;
       }
       return event.tick > sinceTick;
@@ -369,10 +370,11 @@ function handleRequest(request, response) {
     return;
   }
   if (route === "/api/events") {
+    const hasSinceSeq = url.searchParams.has("sinceSeq");
     const sinceSeq = Number.parseInt(url.searchParams.get("sinceSeq") || "0", 10);
     const sinceTick = Number.parseInt(url.searchParams.get("sinceTick") || "-1", 10);
     const events = state.events.filter((event) => {
-      if (Number.isFinite(sinceSeq) && sinceSeq > 0) {
+      if (hasSinceSeq && Number.isFinite(sinceSeq)) {
         return event.seq > sinceSeq;
       }
       return event.tick > sinceTick;
