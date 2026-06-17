@@ -195,7 +195,11 @@ def apply_snn_to_state():
         return None
     if not SNN.training or SNN.paused:
         return None
-    direction = SNN.step(STATE["eventCamera"], STATE["authoritativeTick"])
+    direction = SNN.step(
+        STATE["eventCamera"],
+        STATE["authoritativeTick"],
+        {**STATE, "settings": SETTINGS},
+    )
     if direction is None:
         return None
     if not SNN.should_emit_command(direction, STATE["authoritativeTick"]):

@@ -74,6 +74,20 @@ class PongSNN:
         self.h2_h3_weights = self._build_weights(self.h2_h3_pre)
         self.h3_out_pre = [list(range(self.h3_size)) for _ in OUTPUTS]
         self.h3_out_weights = self._build_output_weights()
+        self.input_eligibility = [0.0 for _ in range(self.input_size)]
+        self.h1_h2_eligibility = self._build_eligibility(self.h1_h2_pre)
+        self.h2_h3_eligibility = self._build_eligibility(self.h2_h3_pre)
+        self.h3_out_eligibility = self._build_eligibility(self.h3_out_pre)
+        self.learning_rate = 0.006
+        self.eligibility_decay = 0.92
+        self.eligibility_plus = 0.16
+        self.eligibility_minus = 0.035
+        self.last_pong_snapshot = None
+        self.recent_hits = 0
+        self.recent_misses = 0
+        self.reward_state = self._empty_reward_state()
+        self.eligibility_stats = self._empty_eligibility_stats()
+        self.learning_stats = self._empty_learning_stats()
 
         self.activity = self._empty_activity()
 
@@ -107,6 +121,9 @@ class PongSNN:
     def _build_weights(self, projection):
         return [[self._rand_weight() for _ in pres] for pres in projection]
 
+    def _build_eligibility(self, projection):
+        return [[0.0 for _ in pres] for pres in projection]
+
     def _build_output_weights(self):
         weights = []
         for output_index, output in enumerate(OUTPUTS):
@@ -137,7 +154,61 @@ class PongSNN:
             "activeHidden1": [],
             "activeHidden2": [],
             "activeHidden3": [],
-            "stdp": {"potentiated": 0, "depressed": 0},
+            "stdp": {
+                "potentiated": 0,
+                "depressed": 0,
+                "eligibilityIncreased": 0,
+                "eligibilityDecreased": 0,
+            },
+        }
+
+    def _empty_reward_state(self):
+        return {
+            "value": 0.0,
+            "components": {
+                "alignment": 0.0,
+                "hit": 0.0,
+                "miss": 0.0,
+                "movementPenalty": 0.0,
+            },
+            "rightPaddleDistance": None,
+            "rightPaddleDelta": 0.0,
+            "lastEvent": None,
+            "recentHits": self.recent_hits,
+            "recentMisses": self.recent_misses,
+        }
+
+    def _empty_eligibility_stats(self):
+        return {
+            "inputH1": self._empty_group_eligibility_stats("inputH1", self.input_size),
+            "h1H2": self._empty_group_eligibility_stats("h1H2", sum(len(row) for row in self.h1_h2_pre)),
+            "h2H3": self._empty_group_eligibility_stats("h2H3", sum(len(row) for row in self.h2_h3_pre)),
+            "h3Output": self._empty_group_eligibility_stats("h3Output", sum(len(row) for row in self.h3_out_pre)),
+        }
+
+    def _empty_group_eligibility_stats(self, name, connections):
+        return {
+            "name": name,
+            "connections": int(connections),
+            "active": 0,
+            "positive": 0,
+            "negative": 0,
+            "meanAbs": 0.0,
+            "maxAbs": 0.0,
+        }
+
+    def _empty_learning_stats(self):
+        return {
+            "step": self.train_steps,
+            "learningRate": self.learning_rate,
+            "rewardApplied": 0.0,
+            "weightUpdates": 0,
+            "potentiated": 0,
+            "depressed": 0,
+            "clamped": 0,
+            "meanAbsDelta": 0.0,
+            "eligibilityIncreased": 0,
+            "eligibilityDecreased": 0,
         }
 
     def architecture(self):
@@ -199,9 +270,12 @@ class PongSNN:
                 "totalConnections": total_connections,
             },
             "stdp": {
-                "aPlus": 0.012,
-                "aMinus": 0.004,
-                "rule": "active pre plus active post potentiates; active pre without post depresses slightly",
+                "mode": "reward-modulated eligibility traces",
+                "learningRate": self.learning_rate,
+                "eligibilityDecay": self.eligibility_decay,
+                "eligibilityPlus": self.eligibility_plus,
+                "eligibilityMinus": self.eligibility_minus,
+                "rule": "local pre/post coactivity updates eligibility; reward gates weight changes",
             },
         }
 
@@ -264,63 +338,266 @@ class PongSNN:
         max_drive = max(1.0, max(drives, default=0.0))
         return drives, [drive / max_drive for drive in drives], winner_index
 
-    def _stdp_input(self, active_pixels, h1_spikes):
+    def _clamp_eligibility(self, value):
+        return max(-1.0, min(1.0, value))
+
+    def _decay_flat_eligibility(self, eligibility):
+        for index, value in enumerate(eligibility):
+            if value == 0.0:
+                continue
+            decayed = value * self.eligibility_decay
+            eligibility[index] = 0.0 if abs(decayed) < 0.00001 else decayed
+
+    def _decay_nested_eligibility(self, eligibility):
+        for row in eligibility:
+            self._decay_flat_eligibility(row)
+
+    def _decay_eligibilities(self):
+        self._decay_flat_eligibility(self.input_eligibility)
+        self._decay_nested_eligibility(self.h1_h2_eligibility)
+        self._decay_nested_eligibility(self.h2_h3_eligibility)
+        self._decay_nested_eligibility(self.h3_out_eligibility)
+
+    def _eligibility_stats_flat(self, name, eligibility):
+        active = 0
+        positive = 0
+        negative = 0
+        total_abs = 0.0
+        max_abs = 0.0
+        for value in eligibility:
+            magnitude = abs(value)
+            if magnitude <= 0.00001:
+                continue
+            active += 1
+            total_abs += magnitude
+            max_abs = max(max_abs, magnitude)
+            if value > 0:
+                positive += 1
+            else:
+                negative += 1
+        connections = len(eligibility)
+        return {
+            "name": name,
+            "connections": connections,
+            "active": active,
+            "positive": positive,
+            "negative": negative,
+            "meanAbs": round(total_abs / max(1, connections), 6),
+            "maxAbs": round(max_abs, 6),
+        }
+
+    def _eligibility_stats_nested(self, name, eligibility):
+        flat = [value for row in eligibility for value in row]
+        return self._eligibility_stats_flat(name, flat)
+
+    def _summarize_eligibility(self):
+        return {
+            "inputH1": self._eligibility_stats_flat("inputH1", self.input_eligibility),
+            "h1H2": self._eligibility_stats_nested("h1H2", self.h1_h2_eligibility),
+            "h2H3": self._eligibility_stats_nested("h2H3", self.h2_h3_eligibility),
+            "h3Output": self._eligibility_stats_nested("h3Output", self.h3_out_eligibility),
+        }
+
+    def _eligibility_input(self, active_pixels, h1_spikes):
         h1_active = set(h1_spikes)
-        changed = {"potentiated": 0, "depressed": 0}
+        changed = {"increased": 0, "decreased": 0}
         for pixel in active_pixels:
             y = pixel // self.width
             x = pixel - y * self.width
             hx = min(self.h1_w - 1, x // self.h1_cell)
             hy = min(self.h1_h - 1, y // self.h1_cell)
             post = _grid_index(hx, hy, self.h1_w)
-            weight = self.input_weights[pixel]
             if post in h1_active:
-                self.input_weights[pixel] = _clamp(weight + 0.012 * (1.0 - weight))
-                changed["potentiated"] += 1
+                self.input_eligibility[pixel] = self._clamp_eligibility(
+                    self.input_eligibility[pixel] + self.eligibility_plus
+                )
+                changed["increased"] += 1
             else:
-                self.input_weights[pixel] = _clamp(weight - 0.004 * weight)
-                changed["depressed"] += 1
+                self.input_eligibility[pixel] = self._clamp_eligibility(
+                    self.input_eligibility[pixel] - self.eligibility_minus
+                )
+                changed["decreased"] += 1
         return changed
 
-    def _stdp_projection(self, pre_spikes, post_spikes, projection, weights):
+    def _eligibility_projection(self, pre_spikes, post_spikes, projection, eligibility):
         pre_active = set(pre_spikes)
         post_active = set(post_spikes)
-        changed = {"potentiated": 0, "depressed": 0}
+        changed = {"increased": 0, "decreased": 0}
         if not pre_active:
             return changed
-        for post, (pres, post_weights) in enumerate(zip(projection, weights)):
+        for post, (pres, post_eligibility) in enumerate(zip(projection, eligibility)):
             active_post = post in post_active
             for offset, pre in enumerate(pres):
                 if pre not in pre_active:
                     continue
-                weight = post_weights[offset]
                 if active_post:
-                    post_weights[offset] = _clamp(weight + 0.012 * (1.0 - weight))
-                    changed["potentiated"] += 1
+                    post_eligibility[offset] = self._clamp_eligibility(
+                        post_eligibility[offset] + self.eligibility_plus
+                    )
+                    changed["increased"] += 1
                 else:
-                    post_weights[offset] = _clamp(weight - 0.004 * weight)
-                    changed["depressed"] += 1
+                    post_eligibility[offset] = self._clamp_eligibility(
+                        post_eligibility[offset] - self.eligibility_minus
+                    )
+                    changed["decreased"] += 1
         return changed
 
-    def _stdp_output(self, h3_spikes, winner_index):
+    def _eligibility_output(self, h3_spikes, winner_index):
         active = set(h3_spikes)
-        changed = {"potentiated": 0, "depressed": 0}
+        changed = {"increased": 0, "decreased": 0}
         if not active:
             return changed
-        for output_index, (pres, weights) in enumerate(zip(self.h3_out_pre, self.h3_out_weights)):
+        for output_index, (pres, eligibility) in enumerate(zip(self.h3_out_pre, self.h3_out_eligibility)):
             for offset, pre in enumerate(pres):
                 if pre not in active:
                     continue
-                weight = weights[offset]
                 if output_index == winner_index:
-                    weights[offset] = _clamp(weight + 0.010 * (1.0 - weight))
-                    changed["potentiated"] += 1
+                    eligibility[offset] = self._clamp_eligibility(eligibility[offset] + self.eligibility_plus)
+                    changed["increased"] += 1
                 else:
-                    weights[offset] = _clamp(weight - 0.003 * weight)
-                    changed["depressed"] += 1
+                    eligibility[offset] = self._clamp_eligibility(eligibility[offset] - self.eligibility_minus)
+                    changed["decreased"] += 1
         return changed
 
-    def step(self, event_camera, tick):
+    def _apply_flat_reward(self, weights, eligibility, reward, stats):
+        if reward == 0.0:
+            return
+        for index, trace in enumerate(eligibility):
+            if abs(trace) <= 0.00001:
+                continue
+            before = weights[index]
+            delta = self.learning_rate * reward * trace
+            after = _clamp(before + delta)
+            if after == before:
+                continue
+            weights[index] = after
+            stats["weightUpdates"] += 1
+            stats["meanAbsDelta"] += abs(after - before)
+            if after == 0.0 or after == 1.0:
+                stats["clamped"] += 1
+            if after > before:
+                stats["potentiated"] += 1
+            else:
+                stats["depressed"] += 1
+
+    def _apply_nested_reward(self, weights, eligibility, reward, stats):
+        for weight_row, eligibility_row in zip(weights, eligibility):
+            self._apply_flat_reward(weight_row, eligibility_row, reward, stats)
+
+    def _apply_rewarded_weights(self, reward, local_changes):
+        stats = self._empty_learning_stats()
+        stats["step"] = self.train_steps + 1
+        stats["rewardApplied"] = round(reward, 5)
+        stats["eligibilityIncreased"] = local_changes["increased"]
+        stats["eligibilityDecreased"] = local_changes["decreased"]
+        self._apply_flat_reward(self.input_weights, self.input_eligibility, reward, stats)
+        self._apply_nested_reward(self.h1_h2_weights, self.h1_h2_eligibility, reward, stats)
+        self._apply_nested_reward(self.h2_h3_weights, self.h2_h3_eligibility, reward, stats)
+        self._apply_nested_reward(self.h3_out_weights, self.h3_out_eligibility, reward, stats)
+        if stats["weightUpdates"] > 0:
+            stats["meanAbsDelta"] = round(stats["meanAbsDelta"] / stats["weightUpdates"], 8)
+        else:
+            stats["meanAbsDelta"] = 0.0
+        return stats
+
+    def _snapshot_pong(self, game_state):
+        if not isinstance(game_state, dict):
+            return None
+        settings = game_state.get("settings") if isinstance(game_state.get("settings"), dict) else {}
+        ball = game_state.get("ball") if isinstance(game_state.get("ball"), dict) else {}
+        paddles = game_state.get("paddles") if isinstance(game_state.get("paddles"), dict) else {}
+        score = game_state.get("score") if isinstance(game_state.get("score"), dict) else {}
+        try:
+            height = float(settings.get("height", self.height))
+            width = float(settings.get("width", self.width))
+            paddle_height = float(settings.get("paddleHeight", 80))
+            ball_size = float(settings.get("ballSize", 10))
+            ball_x = float(ball.get("x", width / 2))
+            ball_y = float(ball.get("y", height / 2))
+            ball_vx = float(ball.get("vx", 0.0))
+            right_y = float(paddles.get("rightY", (height - paddle_height) / 2))
+            left_score = int(score.get("left", 0))
+            right_score = int(score.get("right", 0))
+        except (TypeError, ValueError):
+            return None
+        ball_center = ball_y + ball_size / 2
+        right_center = right_y + paddle_height / 2
+        return {
+            "width": width,
+            "height": height,
+            "paddleHeight": paddle_height,
+            "ballSize": ball_size,
+            "ballX": ball_x,
+            "ballY": ball_y,
+            "ballVx": ball_vx,
+            "rightY": right_y,
+            "rightCenter": right_center,
+            "ballCenter": ball_center,
+            "rightDistance": abs(right_center - ball_center),
+            "leftScore": left_score,
+            "rightScore": right_score,
+        }
+
+    def _reward_from_pong(self, game_state):
+        current = self._snapshot_pong(game_state)
+        if current is None:
+            self.reward_state = self._empty_reward_state()
+            return 0.0
+
+        previous = self.last_pong_snapshot
+        self.last_pong_snapshot = current
+        if previous is None:
+            self.reward_state = {
+                **self._empty_reward_state(),
+                "rightPaddleDistance": round(current["rightDistance"], 3),
+                "recentHits": self.recent_hits,
+                "recentMisses": self.recent_misses,
+            }
+            return 0.0
+
+        movement = abs(current["rightY"] - previous["rightY"])
+        distance_delta = previous["rightDistance"] - current["rightDistance"]
+        alignment_reward = 0.0
+        if movement > 0.01:
+            scale = max(1.0, current["paddleHeight"])
+            alignment_reward = _clamp(distance_delta / scale, -1.0, 1.0) * 0.08
+
+        movement_penalty = 0.0
+        aligned = current["rightDistance"] <= max(current["ballSize"] * 2.0, current["paddleHeight"] * 0.16)
+        if aligned and movement > 0.01:
+            movement_penalty = -0.012
+
+        hit_reward = 0.0
+        miss_reward = 0.0
+        last_event = None
+        right_side = current["ballX"] > current["width"] * 0.65
+        if previous["ballVx"] > 0.0 and current["ballVx"] < 0.0 and right_side:
+            hit_reward = 1.0
+            self.recent_hits += 1
+            last_event = "right-paddle-hit"
+        if current["leftScore"] > previous["leftScore"]:
+            miss_reward = -1.0
+            self.recent_misses += 1
+            last_event = "right-paddle-miss"
+
+        total = alignment_reward + movement_penalty + hit_reward + miss_reward
+        self.reward_state = {
+            "value": round(total, 5),
+            "components": {
+                "alignment": round(alignment_reward, 5),
+                "hit": round(hit_reward, 5),
+                "miss": round(miss_reward, 5),
+                "movementPenalty": round(movement_penalty, 5),
+            },
+            "rightPaddleDistance": round(current["rightDistance"], 3),
+            "rightPaddleDelta": round(distance_delta, 3),
+            "lastEvent": last_event,
+            "recentHits": self.recent_hits,
+            "recentMisses": self.recent_misses,
+        }
+        return total
+
+    def step(self, event_camera, tick, game_state=None):
         if not event_camera:
             return None
         pixels = event_camera.get("pixels") if isinstance(event_camera, dict) else []
@@ -337,16 +614,30 @@ class PongSNN:
         output_drive, output_bars, winner_index = self._output(h3_spikes)
         winner = OUTPUTS[winner_index]
 
-        changed = {"potentiated": 0, "depressed": 0}
+        changed = {
+            "potentiated": 0,
+            "depressed": 0,
+            "eligibilityIncreased": 0,
+            "eligibilityDecreased": 0,
+        }
         if self.training and not self.paused:
+            reward = self._reward_from_pong(game_state)
+            self._decay_eligibilities()
+            local_changes = {"increased": 0, "decreased": 0}
             for update in (
-                self._stdp_input(active_pixels, h1_spikes),
-                self._stdp_projection(h1_spikes, h2_spikes, self.h1_h2_pre, self.h1_h2_weights),
-                self._stdp_projection(h2_spikes, h3_spikes, self.h2_h3_pre, self.h2_h3_weights),
-                self._stdp_output(h3_spikes, winner_index),
+                self._eligibility_input(active_pixels, h1_spikes),
+                self._eligibility_projection(h1_spikes, h2_spikes, self.h1_h2_pre, self.h1_h2_eligibility),
+                self._eligibility_projection(h2_spikes, h3_spikes, self.h2_h3_pre, self.h2_h3_eligibility),
+                self._eligibility_output(h3_spikes, winner_index),
             ):
-                changed["potentiated"] += update["potentiated"]
-                changed["depressed"] += update["depressed"]
+                local_changes["increased"] += update["increased"]
+                local_changes["decreased"] += update["decreased"]
+            self.eligibility_stats = self._summarize_eligibility()
+            self.learning_stats = self._apply_rewarded_weights(reward, local_changes)
+            changed["potentiated"] = self.learning_stats["potentiated"]
+            changed["depressed"] = self.learning_stats["depressed"]
+            changed["eligibilityIncreased"] = local_changes["increased"]
+            changed["eligibilityDecreased"] = local_changes["decreased"]
             self.train_steps += 1
 
         direction = int(winner["direction"])
@@ -369,6 +660,9 @@ class PongSNN:
             "activeHidden2": h2_spikes[:192],
             "activeHidden3": h3_spikes[:128],
             "stdp": changed,
+            "reward": self.reward_state,
+            "eligibility": self.eligibility_stats,
+            "learning": self.learning_stats,
         }
         return direction
 
@@ -390,6 +684,9 @@ class PongSNN:
             "loadedFrom": self.loaded_from,
             "architecture": self.architecture(),
             "activity": self.activity,
+            "reward": self.reward_state,
+            "eligibility": self.eligibility_stats,
+            "learning": self.learning_stats,
             "outputs": OUTPUTS,
         }
 

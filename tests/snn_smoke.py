@@ -43,6 +43,11 @@ def main():
         assert status["activity"]["eventCount"] > 0
         assert status["activity"]["spikes"]["hidden1"] > 0
         assert status["activity"]["winner"] in {"move up", "move down", "stay put"}
+        assert isinstance(status["reward"]["value"], (int, float))
+        assert "inputH1" in status["eligibility"]
+        assert "h3Output" in status["eligibility"]
+        assert status["learning"]["step"] > 0
+        assert "eligibilityIncreased" in status["activity"]["stdp"]
         input_events = request_json(base_url, "/api/inputs?sinceSeq=0")
         assert any(event["type"] == "input" for event in input_events["events"])
         paused = request_json(base_url, "/api/snn/pause", {})

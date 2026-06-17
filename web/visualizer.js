@@ -20,6 +20,10 @@ const winnerEl = document.getElementById("winner");
 const eventCountEl = document.getElementById("eventCount");
 const spikeCountsEl = document.getElementById("spikeCounts");
 const stdpCountsEl = document.getElementById("stdpCounts");
+const rewardReadoutEl = document.getElementById("rewardReadout");
+const eligibilityReadoutEl = document.getElementById("eligibilityReadout");
+const hitMissReadoutEl = document.getElementById("hitMissReadout");
+const learningReadoutEl = document.getElementById("learningReadout");
 const deviceEl = document.getElementById("device");
 const trainStateEl = document.getElementById("trainState");
 
@@ -256,6 +260,26 @@ function renderSnn() {
   }
   const stdp = activity?.stdp || {};
   if (stdpCountsEl) stdpCountsEl.textContent = `stdp +${stdp.potentiated || 0} / -${stdp.depressed || 0}`;
+  const reward = activity?.reward || status?.reward || {};
+  if (rewardReadoutEl) {
+    rewardReadoutEl.textContent = `reward ${formatSigned(reward.value || 0, 3)}`;
+  }
+  const eligibility = activity?.eligibility || status?.eligibility || {};
+  const eligibilityActive = Object.values(eligibility).reduce((total, group) => total + Number(group?.active || 0), 0);
+  const maxEligibility = Object.values(eligibility).reduce(
+    (maxValue, group) => Math.max(maxValue, Number(group?.maxAbs || 0)),
+    0
+  );
+  if (eligibilityReadoutEl) {
+    eligibilityReadoutEl.textContent = `eligibility ${eligibilityActive} traces / max ${maxEligibility.toFixed(3)}`;
+  }
+  if (hitMissReadoutEl) {
+    hitMissReadoutEl.textContent = `hits ${reward.recentHits || 0} / misses ${reward.recentMisses || 0}`;
+  }
+  const learning = activity?.learning || status?.learning || {};
+  if (learningReadoutEl) {
+    learningReadoutEl.textContent = `learn step ${learning.step || 0} / updates ${learning.weightUpdates || 0}`;
+  }
   const device = status?.architecture?.device;
   if (deviceEl) {
     const active = device?.active || "cpu";
@@ -266,6 +290,12 @@ function renderSnn() {
     trainStateEl.textContent = status?.training && !status?.paused ? "training" : "paused";
   }
   drawNetworkDesign();
+}
+
+function formatSigned(value, digits) {
+  const numeric = Number(value || 0);
+  const sign = numeric > 0 ? "+" : "";
+  return `${sign}${numeric.toFixed(digits)}`;
 }
 
 function drawActivityGrid(ctx, activeIndices, grid, x, y, width, height, color) {

@@ -3,7 +3,7 @@
 A minimal local Pong surface with a backend-owned sparse SNN trainer.
 
 The Python backend runs Pong, generates virtual event-camera frames, owns the
-SNN, applies basic STDP, and sends `up`, `down`, or `stay` paddle commands back
+SNN, applies reward-modulated STDP, and sends `up`, `down`, or `stay` paddle commands back
 into the same backend simulation.
 
 ## Run
@@ -47,10 +47,14 @@ The current SNN is intentionally basic:
 - Hidden layer 3: `20 x 12`, sparse `5 x 5` neighborhoods over hidden layer 2.
 - Output: `move up`, `move down`, `stay put`.
 
-Training is local STDP only in this first pass. Active pre plus active post
-potentiates a connection; active pre without a post spike depresses it slightly.
-The code has a backend device descriptor and checks for Torch/CUDA, but the
-dependency-free path runs on CPU when Torch is unavailable.
+Training uses reward-modulated STDP eligibility traces. Active pre plus active
+post increases a synapse group's eligibility trace, active pre without post
+decreases it slightly, and traces decay each tick. Pong reward then gates
+weights with `weight += learning_rate * reward * eligibility`, clamped to the
+network's existing weight range. `/api/snn/status` reports reward components,
+eligibility summaries, recent right-paddle hit/miss counts, and learning-step
+update stats. The code has a backend device descriptor and checks for
+Torch/CUDA, but the dependency-free path runs on CPU when Torch is unavailable.
 
 SNN controls:
 

@@ -77,6 +77,10 @@ function fakeContext(backendFrame) {
     eventCount: { textContent: "" },
     spikeCounts: { textContent: "" },
     stdpCounts: { textContent: "" },
+    rewardReadout: { textContent: "" },
+    eligibilityReadout: { textContent: "" },
+    hitMissReadout: { textContent: "" },
+    learningReadout: { textContent: "" },
     device: { textContent: "" },
     trainState: { textContent: "" },
     reset: { addEventListener() {} },
@@ -129,7 +133,15 @@ function fakeContext(backendFrame) {
         body = {
           training: true,
           paused: false,
-          activity: { outputBars: [0.2, 0.7, 0.1], winner: "move down", spikes: {}, stdp: {} },
+          activity: {
+            outputBars: [0.2, 0.7, 0.1],
+            winner: "move down",
+            spikes: {},
+            stdp: {},
+            reward: { value: 0, recentHits: 0, recentMisses: 0 },
+            eligibility: {},
+            learning: { step: 0, weightUpdates: 0 },
+          },
           architecture: { device: { active: "cpu", cudaAvailable: false }, input: { width: 800, height: 450 }, layers: [] },
         };
       } else if (href.includes("/api/snn/saves")) {
