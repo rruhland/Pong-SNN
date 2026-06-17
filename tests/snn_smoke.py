@@ -34,25 +34,17 @@ def main():
         assert started["snn"]["paused"] is False
         startup_events = request_json(base_url, "/api/events?sinceSeq=0&sinceTick=9999")
         assert any(event["type"] == "start" for event in startup_events["events"])
-        state = request_json(
-            base_url,
-            "/api/state",
-            {
-                "tick": 5,
-                "running": True,
-                "eventCamera": {
-                    "width": 800,
-                    "height": 450,
-                    "tick": 5,
-                    "frameSeq": 5,
-                    "pixels": [1000, 1001, 1002, 8010, 8011, 8012, 16020],
-                },
-            },
-        )
-        assert state["snnEvent"]["type"] == "input"
+        time.sleep(0.25)
+        autonomous_state = request_json(base_url, "/api/state")
+        assert autonomous_state["running"] is True
+        assert autonomous_state["tick"] > 0
+        assert autonomous_state["eventCamera"]["source"] == "backend"
         status = request_json(base_url, "/api/snn/status")
+        assert status["activity"]["eventCount"] > 0
         assert status["activity"]["spikes"]["hidden1"] > 0
         assert status["activity"]["winner"] in {"move up", "move down", "stay put"}
+        input_events = request_json(base_url, "/api/inputs?sinceSeq=0")
+        assert any(event["type"] == "input" for event in input_events["events"])
         paused = request_json(base_url, "/api/snn/pause", {})
         assert paused["snn"]["paused"] is True
         print(json.dumps({"ok": True, "winner": status["activity"]["winner"], "direction": status["activity"]["direction"]}))

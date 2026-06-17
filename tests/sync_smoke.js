@@ -36,7 +36,7 @@ class FakeBroadcastChannel {
   }
 }
 
-function fakeContext() {
+function fakeContext(backendFrame) {
   const listeners = new Map();
   const drawCalls = [];
   let fillStyle = "";
@@ -51,20 +51,45 @@ function fakeContext() {
         fillRect(...args) {
           drawCalls.push({ fillStyle, args });
         },
+        strokeRect() {},
+        beginPath() {},
+        moveTo() {},
+        lineTo() {},
+        stroke() {},
+        fillText() {},
         setTransform() {},
         set fillStyle(value) {
           fillStyle = value;
         },
+        set strokeStyle(value) {},
+        set lineWidth(value) {},
+        set font(value) {},
+        set textAlign(value) {},
       };
     },
   };
   const elements = {
     game: canvas,
     preview: canvas,
+    networkDesign: canvas,
     score: { textContent: "" },
+    winner: { textContent: "" },
+    eventCount: { textContent: "" },
+    spikeCounts: { textContent: "" },
+    stdpCounts: { textContent: "" },
+    device: { textContent: "" },
+    trainState: { textContent: "" },
     reset: { addEventListener() {} },
+    start: { addEventListener() {} },
+    pause: { addEventListener() {} },
+    saveNetwork: { addEventListener() {} },
+    loadNetwork: { addEventListener() {} },
+    savedNetworks: { value: "", textContent: "", appendChild() {}, options: [] },
     trailMs: { value: "120", addEventListener() {} },
     trailValue: { textContent: "" },
+    barUp: { style: {} },
+    barDown: { style: {} },
+    barStay: { style: {} },
   };
 
   const context = {
@@ -78,21 +103,38 @@ function fakeContext() {
       preventDefault() {}
     },
     document: {
+      createElement() {
+        return { value: "", textContent: "" };
+      },
       getElementById(id) {
         return elements[id];
       },
     },
     fetch: async (url) => {
-      const body = url.includes("/api/session")
-        ? {
-            sessionId: "smoke-session",
-            resetToken: 0,
-            seed: 123,
-            tick: 0,
-            mode: "human",
-            settings: { pollMs: 16, statePushMs: 16 },
-          }
-        : { events: [] };
+      const href = String(url);
+      let body = {};
+      if (href.includes("/api/state")) {
+        body = backendFrame;
+      } else if (href.includes("/api/session")) {
+        body = {
+          sessionId: backendFrame.sessionId,
+          resetToken: backendFrame.resetToken,
+          seed: backendFrame.seed,
+          tick: backendFrame.tick,
+          mode: "api",
+          running: backendFrame.running,
+          settings: { pollMs: 16, statePushMs: 16 },
+        };
+      } else if (href.includes("/api/snn/status")) {
+        body = {
+          training: true,
+          paused: false,
+          activity: { outputBars: [0.2, 0.7, 0.1], winner: "move down", spikes: {}, stdp: {} },
+          architecture: { device: { active: "cpu", cudaAvailable: false }, input: { width: 800, height: 450 }, layers: [] },
+        };
+      } else if (href.includes("/api/snn/saves")) {
+        body = { saves: [] };
+      }
       return {
         ok: true,
         json: async () => body,
@@ -131,72 +173,68 @@ function fakeContext() {
   return context;
 }
 
-const visualizer = fakeContext();
+const backendFrame = {
+  sessionId: "backend-smoke",
+  resetToken: 3,
+  seed: 123,
+  tick: 42,
+  authoritativeTick: 42,
+  frameSeq: 42,
+  running: true,
+  settings: { width: 800, height: 450, paddleWidth: 10, paddleHeight: 80, ballSize: 10, fixedDt: 1 / 60 },
+  score: { left: 2, right: 1 },
+  ball: { x: 500, y: 180, vx: 200, vy: -30 },
+  paddles: { leftY: 140, rightY: 220 },
+  eventCamera: {
+    width: 800,
+    height: 450,
+    tick: 42,
+    frameSeq: 42,
+    resetToken: 3,
+    source: "backend",
+    pixels: [1000, 1001, 1002],
+    count: 3,
+  },
+  source: "backend-sim",
+};
+
+const visualizer = fakeContext(backendFrame);
 vm.runInContext(visualizerSource, visualizer, { filename: "visualizer.js" });
 
-const game = fakeContext();
+const game = fakeContext(backendFrame);
 vm.runInContext(gameSource, game, { filename: "game.js" });
 
-vm.runInContext(
-  `
-  PongCore.start(client.sim);
-  for (let i = 0; i < 12; i += 1) {
-    PongCore.step(client.sim, []);
-    client.frameSeq += 1;
-    broadcastState(frameState(100 + i));
-  }
-`,
-  game
-);
+vm.runInContext("acceptState(" + JSON.stringify(backendFrame) + "); render();", game);
 
 const latestGameFrame = game.window.__pongLatestFrame;
 const latestVisualizerFrame = visualizer.window.__pongViewerState;
 const asJson = (value) => JSON.stringify(value);
 
-assert(latestVisualizerFrame, "visualizer should accept game frame");
+assert(latestGameFrame, "game should accept backend frame");
+assert(latestVisualizerFrame, "visualizer should receive game-broadcast backend frame");
 assert.strictEqual(latestVisualizerFrame.source, "game-channel");
-assert.strictEqual(latestVisualizerFrame.frameSeq, latestGameFrame.frameSeq);
-assert.strictEqual(latestVisualizerFrame.tick, latestGameFrame.tick);
-assert.strictEqual(asJson(latestVisualizerFrame.score), asJson(latestGameFrame.score));
-assert.strictEqual(asJson(latestVisualizerFrame.ball), asJson(latestGameFrame.ball));
-assert.strictEqual(asJson(latestVisualizerFrame.paddles), asJson(latestGameFrame.paddles));
-assert(latestGameFrame.eventCamera, "game frame should include event camera output");
-assert(Array.isArray(latestGameFrame.eventCamera.pixels), "event camera pixels should be an array");
-assert(latestGameFrame.eventCamera.pixels.length > 0, "moving game objects should emit event pixels");
-assert.strictEqual(asJson(latestVisualizerFrame.eventCamera), asJson(latestGameFrame.eventCamera));
+assert.strictEqual(latestVisualizerFrame.frameSeq, backendFrame.frameSeq);
+assert.strictEqual(latestVisualizerFrame.tick, backendFrame.tick);
+assert.strictEqual(asJson(latestVisualizerFrame.score), asJson(backendFrame.score));
+assert.strictEqual(asJson(latestVisualizerFrame.ball), asJson(backendFrame.ball));
+assert.strictEqual(asJson(latestVisualizerFrame.paddles), asJson(backendFrame.paddles));
+assert.strictEqual(asJson(latestVisualizerFrame.eventCamera), asJson(backendFrame.eventCamera));
 
 visualizer.window.__drawCalls.length = 0;
-vm.runInContext("for (let i = 0; i < 10; i += 1) render();", visualizer);
-assert.strictEqual(visualizer.window.__pongViewerState.frameSeq, latestGameFrame.frameSeq);
+vm.runInContext("for (let i = 0; i < 2; i += 1) render();", visualizer);
 assert(
   visualizer.window.__drawCalls.some((call) => call.fillStyle === "rgba(255, 0, 0, 1.000)"),
-  "visualizer should draw fresh event camera pixels as an opaque red overlay"
+  "visualizer should draw backend event camera pixels as an opaque red overlay"
 );
-
-vm.runInContext(
-  `
-  const resetState = {
-    ...frameState(200),
-    frameSeq: 0,
-    tick: 0,
-    resetToken: 1,
-    sessionId: "smoke-session-reset"
-  };
-  broadcastState(resetState);
-`,
-  game
-);
-assert.strictEqual(visualizer.window.__pongViewerState.resetToken, 1);
-assert.strictEqual(visualizer.window.__pongViewerState.frameSeq, 0);
 
 console.log(
   JSON.stringify(
     {
       ok: true,
-      frameSeq: visualizer.window.__pongViewerState.frameSeq,
-      tick: visualizer.window.__pongViewerState.tick,
-      source: visualizer.window.__pongViewerState.source,
-      resetToken: visualizer.window.__pongViewerState.resetToken,
+      frameSeq: latestVisualizerFrame.frameSeq,
+      tick: latestVisualizerFrame.tick,
+      source: latestVisualizerFrame.source,
+      resetToken: latestVisualizerFrame.resetToken,
     },
     null,
     2

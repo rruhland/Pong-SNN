@@ -5,6 +5,7 @@ import argparse
 import copy
 import json
 import mimetypes
+import random
 import threading
 import time
 
@@ -55,6 +56,15 @@ STATE = {
 
 STATE_LOCK = threading.Lock()
 SNN = PongSNN(SETTINGS["width"], SETTINGS["height"], save_dir=NETWORK_SAVE_ROOT)
+SIM_RNG = random.Random(STATE["seed"])
+EVENT_CAMERA_PREVIOUS = None
+EVENT_CAMERA_TOKEN = None
+SIM_THREAD = None
+SIM_THREAD_LOCK = threading.Lock()
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 def parse_direction(value):
@@ -201,10 +211,223 @@ def apply_snn_to_state():
     )
 
 
+def reset_ball(direction):
+    angle = SIM_RNG.random() * 0.7 - 0.35
+    speed = float(STATE["ball"].get("speed", 275))
+    STATE["ball"] = {
+        "x": SETTINGS["width"] / 2,
+        "y": SETTINGS["height"] / 2,
+        "vx": math_cos(angle) * speed * direction,
+        "vy": math_sin(angle) * speed,
+        "speed": speed,
+    }
+
+
+def math_sin(value):
+    import math
+
+    return math.sin(value)
+
+
+def math_cos(value):
+    import math
+
+    return math.cos(value)
+
+
+def start_simulation():
+    if not STATE["running"]:
+        STATE["running"] = True
+    if float(STATE["ball"].get("vx", 0)) == 0 and float(STATE["ball"].get("vy", 0)) == 0:
+        reset_ball(-1 if SIM_RNG.random() < 0.5 else 1)
+
+
+def apply_due_events():
+    for event in sorted(STATE["events"], key=lambda item: (item["tick"], item["seq"])):
+        seq = int(event.get("seq", 0))
+        if seq <= STATE["appliedEventSeq"] or int(event.get("tick", 0)) > STATE["authoritativeTick"]:
+            continue
+        event_type = event.get("type", "input")
+        if event_type == "start":
+            start_simulation()
+        elif event_type == "pause":
+            STATE["running"] = False
+        elif event_type == "input":
+            STATE["apiDirection"] = parse_direction(event.get("direction"))
+            STATE["appliedInputSeq"] = max(STATE["appliedInputSeq"], seq)
+        STATE["appliedEventSeq"] = max(STATE["appliedEventSeq"], seq)
+
+
+def update_paddles(dt):
+    ball = STATE["ball"]
+    paddles = STATE["paddles"]
+    target = float(ball["y"]) - SETTINGS["paddleHeight"] / 2
+    left_start = float(paddles["leftY"])
+    left_delta = clamp(target - left_start, -320 * dt, 320 * dt)
+    left_y = clamp(left_start + left_delta, 0, SETTINGS["height"] - SETTINGS["paddleHeight"])
+    paddles["leftY"] = left_y
+    paddles["leftVy"] = (left_y - left_start) / dt if dt > 0 else 0
+
+    right_start = float(paddles["rightY"])
+    right_y = clamp(
+        right_start + int(STATE["apiDirection"]) * 360 * dt,
+        0,
+        SETTINGS["height"] - SETTINGS["paddleHeight"],
+    )
+    paddles["rightY"] = right_y
+    paddles["rightVy"] = (right_y - right_start) / dt if dt > 0 else 0
+
+
+def paddle_hit(x, y):
+    ball = STATE["ball"]
+    return (
+        float(ball["x"]) < x + SETTINGS["paddleWidth"]
+        and float(ball["x"]) + SETTINGS["ballSize"] > x
+        and float(ball["y"]) < y + SETTINGS["paddleHeight"]
+        and float(ball["y"]) + SETTINGS["ballSize"] > y
+    )
+
+
+def bounce_from_paddle(paddle_y, paddle_vy, direction):
+    import math
+
+    ball = STATE["ball"]
+    ball_center = float(ball["y"]) + SETTINGS["ballSize"] / 2
+    paddle_center = paddle_y + SETTINGS["paddleHeight"] / 2
+    normalized = clamp((ball_center - paddle_center) / (SETTINGS["paddleHeight"] / 2), -1, 1)
+    speed = min(float(ball.get("speed", 275)) + 8, 520)
+    incoming_vy = float(ball["vy"])
+    max_vertical = speed * 0.88
+    ball["speed"] = speed
+    ball["vy"] = clamp(incoming_vy * 0.85 + paddle_vy * 0.45 + normalized * speed * 0.18, -max_vertical, max_vertical)
+    ball["vx"] = direction * math.sqrt(max(0, speed**2 - float(ball["vy"]) ** 2))
+
+
+def update_ball(dt):
+    ball = STATE["ball"]
+    ball["x"] = float(ball["x"]) + float(ball["vx"]) * dt
+    ball["y"] = float(ball["y"]) + float(ball["vy"]) * dt
+
+    if ball["y"] <= 0:
+        ball["y"] = 0
+        ball["vy"] = abs(float(ball["vy"]))
+    elif ball["y"] + SETTINGS["ballSize"] >= SETTINGS["height"]:
+        ball["y"] = SETTINGS["height"] - SETTINGS["ballSize"]
+        ball["vy"] = -abs(float(ball["vy"]))
+
+    left_x = 24
+    right_x = SETTINGS["width"] - 34
+    if float(ball["vx"]) < 0 and paddle_hit(left_x, float(STATE["paddles"]["leftY"])):
+        ball["x"] = left_x + SETTINGS["paddleWidth"]
+        bounce_from_paddle(float(STATE["paddles"]["leftY"]), float(STATE["paddles"].get("leftVy", 0)), 1)
+    elif float(ball["vx"]) > 0 and paddle_hit(right_x, float(STATE["paddles"]["rightY"])):
+        ball["x"] = right_x - SETTINGS["ballSize"]
+        bounce_from_paddle(float(STATE["paddles"]["rightY"]), float(STATE["paddles"].get("rightVy", 0)), -1)
+
+    if ball["x"] + SETTINGS["ballSize"] < 0:
+        STATE["score"]["right"] += 1
+        ball["speed"] = 275
+        reset_ball(1)
+    elif ball["x"] > SETTINGS["width"]:
+        STATE["score"]["left"] += 1
+        ball["speed"] = 275
+        reset_ball(-1)
+
+
+def rasterize_state():
+    width = SETTINGS["width"]
+    height = SETTINGS["height"]
+    mask = bytearray(width * height)
+
+    def mark_rect(x, y, rect_width, rect_height):
+        left = int(clamp(int(x), 0, width))
+        right = int(clamp(int(x + rect_width + 0.999), 0, width))
+        top = int(clamp(int(y), 0, height))
+        bottom = int(clamp(int(y + rect_height + 0.999), 0, height))
+        if left >= right or top >= bottom:
+            return
+        for row in range(top, bottom):
+            start = row * width + left
+            mask[start : row * width + right] = b"\x01" * (right - left)
+
+    for y in range(0, SETTINGS["height"], 24):
+        mark_rect(SETTINGS["width"] / 2 - 1, y, 2, 12)
+    mark_rect(24, float(STATE["paddles"]["leftY"]), SETTINGS["paddleWidth"], SETTINGS["paddleHeight"])
+    mark_rect(SETTINGS["width"] - 34, float(STATE["paddles"]["rightY"]), SETTINGS["paddleWidth"], SETTINGS["paddleHeight"])
+    mark_rect(float(STATE["ball"]["x"]), float(STATE["ball"]["y"]), SETTINGS["ballSize"], SETTINGS["ballSize"])
+    return mask
+
+
+def capture_event_frame():
+    global EVENT_CAMERA_PREVIOUS, EVENT_CAMERA_TOKEN
+
+    mask = rasterize_state()
+    pixels = []
+    changed_baseline = EVENT_CAMERA_PREVIOUS is None or EVENT_CAMERA_TOKEN != STATE["resetToken"]
+    if not changed_baseline:
+        pixels = [index for index, value in enumerate(mask) if value != EVENT_CAMERA_PREVIOUS[index]]
+    EVENT_CAMERA_PREVIOUS = mask
+    EVENT_CAMERA_TOKEN = STATE["resetToken"]
+    return {
+        "width": SETTINGS["width"],
+        "height": SETTINGS["height"],
+        "tick": STATE["authoritativeTick"],
+        "frameSeq": STATE["frameSeq"],
+        "resetToken": STATE["resetToken"],
+        "renderedAt": STATE["renderedAt"],
+        "source": "backend",
+        "pixels": pixels,
+        "count": len(pixels),
+    }
+
+
+def backend_step():
+    apply_due_events()
+    update_paddles(SETTINGS["fixedDt"])
+    if STATE["running"]:
+        update_ball(SETTINGS["fixedDt"])
+    STATE["authoritativeTick"] += 1
+    STATE["frameSeq"] += 1
+    STATE["renderedAt"] = time.time() * 1000
+    STATE["eventCamera"] = capture_event_frame()
+    apply_snn_to_state()
+    STATE["source"] = "backend-sim"
+    STATE["updatedAt"] = time.time()
+    compact_events()
+
+
+def backend_loop():
+    next_frame = time.perf_counter()
+    while True:
+        with STATE_LOCK:
+            backend_step()
+        next_frame += SETTINGS["fixedDt"]
+        delay = next_frame - time.perf_counter()
+        if delay < -0.25:
+            next_frame = time.perf_counter()
+            delay = SETTINGS["fixedDt"]
+        time.sleep(max(0.001, delay))
+
+
+def ensure_backend_loop():
+    global SIM_THREAD
+
+    with SIM_THREAD_LOCK:
+        if SIM_THREAD and SIM_THREAD.is_alive():
+            return
+        SIM_THREAD = threading.Thread(target=backend_loop, daemon=True, name="pong-backend-sim")
+        SIM_THREAD.start()
+
+
 def reset_game_state(reset_score=True):
+    global SIM_RNG, EVENT_CAMERA_PREVIOUS, EVENT_CAMERA_TOKEN
+
     STATE["sessionId"] = f"local-{int(time.time() * 1000):x}"
     STATE["resetToken"] += 1
     STATE["seed"] = int(time.time() * 1000) & 0xFFFFFFFF
+    SIM_RNG = random.Random(STATE["seed"])
+    EVENT_CAMERA_PREVIOUS = None
+    EVENT_CAMERA_TOKEN = None
     STATE["authoritativeTick"] = 0
     STATE["eventSeq"] = 0
     STATE["events"] = []
@@ -214,7 +437,7 @@ def reset_game_state(reset_score=True):
     STATE["running"] = False
     if reset_score:
         STATE["score"] = {"left": 0, "right": 0}
-    STATE["ball"] = {"x": SETTINGS["width"] / 2, "y": SETTINGS["height"] / 2, "vx": 0, "vy": 0}
+    STATE["ball"] = {"x": SETTINGS["width"] / 2, "y": SETTINGS["height"] / 2, "vx": 0, "vy": 0, "speed": 275}
     STATE["paddles"] = {
         "leftY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
         "rightY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
@@ -242,6 +465,7 @@ class PongHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        ensure_backend_loop()
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/" or path == "/index.html":
@@ -304,6 +528,7 @@ class PongHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not found")
 
     def do_POST(self):
+        ensure_backend_loop()
         try:
             body = read_json(self)
             path = urlparse(self.path).path
@@ -491,6 +716,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
+    ensure_backend_loop()
     server = ThreadingHTTPServer((args.host, args.port), PongHandler)
     print(f"Pong SNN server listening at http://{args.host}:{args.port}")
     try:

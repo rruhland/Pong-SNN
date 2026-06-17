@@ -2,9 +2,9 @@
 
 A minimal local Pong surface with a backend-owned sparse SNN trainer.
 
-The browser game renders Pong and publishes a virtual event-camera frame. The
-Python backend owns the SNN, consumes those event-camera spikes, applies basic
-STDP, and sends `up`, `down`, or `stay` paddle commands back through the API.
+The Python backend runs Pong, generates virtual event-camera frames, owns the
+SNN, applies basic STDP, and sends `up`, `down`, or `stay` paddle commands back
+into the same backend simulation.
 
 ## Run
 
@@ -18,27 +18,24 @@ If Python is not on PATH in this Codex environment, the bundled runtime works:
 C:\Users\rruhl\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe server.py
 ```
 
-Open http://127.0.0.1:8000 and press any key to start.
-
-Open the separate visualizer in another window or side-by-side browser tab:
+Open the visualizer:
 
 ```text
 http://127.0.0.1:8000/visualizer
 ```
 
-The game page is the source of truth. It runs the Pong simulation, publishes the
-exact rendered frame over a browser `BroadcastChannel`, and checkpoints the same
-frame to `/api/state` at frame-rate cadence. The visualizer is passive and
-mirror-only: it never advances its own Pong simulation, so a virtual event camera
-should attach to the game page while the visualizer shows that same live game
-state in real time.
+The visualizer is the training controller. Start, pause, reset, save, and load
+can all be driven from that page without opening the standalone Pong page.
 
-Each published game frame now includes `eventCamera`, a game-side virtual event
-camera payload. `eventCamera.pixels` is a list of changed logical game-pixel
-indices, encoded as `y * eventCamera.width + x`. The backend SNN treats every
-Pong pixel as a possible input neuron, while only those event pixels spike on a
-given frame. The visualizer draws those events as an overlay; it does not sample
-its own canvas to generate events or train the model.
+The standalone game page at http://127.0.0.1:8000/ is a mirror of backend state.
+You can open it at any time and it will show the same tick, ball, paddles, score,
+and event-camera frame that the visualizer is using.
+
+Each backend frame includes `eventCamera`. `eventCamera.pixels` is a list of
+changed logical game-pixel indices, encoded as `y * eventCamera.width + x`. The
+backend SNN treats every Pong pixel as a possible input neuron, while only those
+event pixels spike on a given frame. The visualizer draws those events as an
+overlay; it does not sample its own canvas to generate events or train the model.
 
 ## Backend SNN
 
@@ -69,7 +66,8 @@ Saved networks are JSON files under `network_saves/`.
 
 ## Controls
 
-The right paddle defaults to human keyboard control:
+The visualizer defaults to SNN/API control. If you open the standalone game page,
+keyboard input can also publish right-paddle commands:
 
 - `ArrowUp` or `W`: move up
 - `ArrowDown` or `S`: move down
@@ -147,5 +145,5 @@ C:\Users\rruhl\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\p
 ```
 
 The smoke test runs the game and visualizer scripts in separate browser-like
-contexts with a shared frame channel. It fails if the visualizer mutates or
-reconstructs state instead of preserving the exact frame published by the game.
+contexts with a shared frame channel. It fails if the game mirror or visualizer
+mutates backend state instead of preserving the exact backend frame.
