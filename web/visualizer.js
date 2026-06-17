@@ -2,6 +2,8 @@ const canvas = document.getElementById("preview");
 const ctx = canvas.getContext("2d");
 const scoreEl = document.getElementById("score");
 const resetButton = document.getElementById("reset");
+const trailInput = document.getElementById("trailMs");
+const trailValue = document.getElementById("trailValue");
 
 const viewer = {
   latestState: null,
@@ -13,6 +15,9 @@ const viewer = {
   pollMs: 16,
   backendPollMs: 16,
   source: "waiting",
+  eventTrail: [],
+  trailMs: Number(trailInput?.value || 120),
+  lastTrailKey: null,
 };
 
 function resize() {
@@ -75,7 +80,14 @@ function normalizeEventCamera(rawEventCamera, settings) {
   };
 }
 
-function drawEventOverlay(ctx, canvasWidth, canvasHeight, eventCamera) {
+function colorForEventAge(ageRatio) {
+  const clamped = Math.max(0, Math.min(1, ageRatio));
+  const green = clamped < 0.5 ? Math.round(330 * clamped) : Math.round(165 + 180 * (clamped - 0.5));
+  const alpha = Math.max(0, 1 - clamped * 0.85);
+  return `rgba(255, ${green}, 0, ${alpha.toFixed(3)})`;
+}
+
+function drawEventPixels(ctx, canvasWidth, canvasHeight, eventCamera, fillStyle) {
   if (!eventCamera || eventCamera.pixels.length === 0) return;
   const scaleX = canvasWidth / eventCamera.width;
   const scaleY = canvasHeight / eventCamera.height;
@@ -87,7 +99,7 @@ function drawEventOverlay(ctx, canvasWidth, canvasHeight, eventCamera) {
   let runEnd = -1;
   let runRow = -1;
 
-  ctx.fillStyle = "rgba(255, 0, 0, .25)";
+  ctx.fillStyle = fillStyle;
   for (const pixel of eventCamera.pixels) {
     const row = Math.floor(pixel / eventCamera.width);
     if (runStart >= 0 && row === runRow && pixel === runEnd + 1) {
@@ -103,6 +115,35 @@ function drawEventOverlay(ctx, canvasWidth, canvasHeight, eventCamera) {
   }
   if (runStart >= 0) {
     flushRun(runStart, runEnd, runRow);
+  }
+}
+
+function pruneEventTrail(now = performance.now()) {
+  viewer.eventTrail = viewer.eventTrail.filter((entry) => now - entry.receivedAt <= viewer.trailMs);
+}
+
+function rememberEventCamera(state) {
+  const eventCamera = state.eventCamera;
+  if (!eventCamera || eventCamera.pixels.length === 0) return;
+  const key = `${state.resetToken ?? ""}:${eventCamera.frameSeq ?? state.frameSeq}:${eventCamera.tick ?? state.tick}`;
+  if (key === viewer.lastTrailKey) return;
+
+  viewer.lastTrailKey = key;
+  viewer.eventTrail.push({
+    key,
+    receivedAt: performance.now(),
+    eventCamera,
+  });
+  pruneEventTrail();
+}
+
+function drawEventTrail(ctx, canvasWidth, canvasHeight) {
+  const now = performance.now();
+  pruneEventTrail(now);
+  for (const entry of viewer.eventTrail) {
+    const ageRatio = viewer.trailMs <= 0 ? 1 : (now - entry.receivedAt) / viewer.trailMs;
+    if (ageRatio > 1) continue;
+    drawEventPixels(ctx, canvasWidth, canvasHeight, entry.eventCamera, colorForEventAge(ageRatio));
   }
 }
 
@@ -131,6 +172,11 @@ function acceptState(rawState, source) {
   viewer.sessionId = state.sessionId || viewer.sessionId;
   viewer.resetToken = state.resetToken ?? viewer.resetToken;
   viewer.seed = state.seed ?? viewer.seed;
+  if (isNewSession || isResetState) {
+    viewer.eventTrail = [];
+    viewer.lastTrailKey = null;
+  }
+  rememberEventCamera(state);
   window.__pongViewerState = state;
 }
 
@@ -155,7 +201,7 @@ function render() {
   }
 
   PongCore.drawState(ctx, canvas.clientWidth, canvas.clientHeight, viewer.latestState);
-  drawEventOverlay(ctx, canvas.clientWidth, canvas.clientHeight, viewer.latestState.eventCamera);
+  drawEventTrail(ctx, canvas.clientWidth, canvas.clientHeight);
   scoreEl.textContent = `${viewer.latestState.score.left}:${viewer.latestState.score.right}`;
   viewer.lastRenderedFrameSeq = viewer.latestState.frameSeq;
 }
@@ -214,6 +260,15 @@ function frame() {
 }
 
 resetButton.addEventListener("click", resetGame);
+if (trailInput) {
+  trailInput.addEventListener("input", () => {
+    viewer.trailMs = Number(trailInput.value);
+    if (trailValue) {
+      trailValue.textContent = `${viewer.trailMs}ms`;
+    }
+    pruneEventTrail();
+  });
+}
 if (viewer.stateChannel) {
   viewer.stateChannel.addEventListener("message", (event) => {
     acceptState(event.data, "game-channel");

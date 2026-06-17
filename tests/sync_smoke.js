@@ -63,6 +63,8 @@ function fakeContext() {
     preview: canvas,
     score: { textContent: "" },
     reset: { addEventListener() {} },
+    trailMs: { value: "120", addEventListener() {} },
+    trailValue: { textContent: "" },
   };
 
   const context = {
@@ -167,8 +169,8 @@ visualizer.window.__drawCalls.length = 0;
 vm.runInContext("for (let i = 0; i < 10; i += 1) render();", visualizer);
 assert.strictEqual(visualizer.window.__pongViewerState.frameSeq, latestGameFrame.frameSeq);
 assert(
-  visualizer.window.__drawCalls.some((call) => call.fillStyle === "#ff0000"),
-  "visualizer should draw event camera pixels as a red overlay"
+  visualizer.window.__drawCalls.some((call) => call.fillStyle === "rgba(255, 0, 0, 1.000)"),
+  "visualizer should draw fresh event camera pixels as an opaque red overlay"
 );
 
 vm.runInContext(

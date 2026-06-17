@@ -10,6 +10,11 @@
   <main class="visualizer">
     <aside class="controls">
       <button id="reset" type="button">reset</button>
+      <label class="trail-control" for="trailMs">
+        <span>trail</span>
+        <input id="trailMs" type="range" min="0" max="500" step="10" value="120">
+        <output id="trailValue" for="trailMs">120ms</output>
+      </label>
     </aside>
     <section class="game-panel">
       <canvas id="preview" aria-label="Pong state preview"></canvas>

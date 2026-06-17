@@ -29,6 +29,24 @@ body {
   text-align: center;
 }
 
+.trail-control {
+  display: grid;
+  gap: 14px;
+  width: min(220px, calc(100% - 40px));
+  margin: 42px auto 0;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.trail-control input {
+  width: 100%;
+  accent-color: #000;
+}
+
+.trail-control output {
+  font-size: 18px;
+}
+
 button {
   appearance: none;
   border: 0;
