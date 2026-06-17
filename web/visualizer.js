@@ -425,13 +425,18 @@ async function postSnn(path, body = {}) {
   return response.json();
 }
 
+function nextObservedTick() {
+  const tick = Number(viewer.latestState?.tick ?? viewer.latestState?.authoritativeTick ?? 0);
+  return Number.isFinite(tick) && tick >= 0 ? Math.floor(tick) + 1 : undefined;
+}
+
 async function startSnn() {
-  const payload = await postSnn("/api/snn/start");
+  const payload = await postSnn("/api/snn/start", { tick: nextObservedTick() });
   if (payload?.snn) viewer.snnStatus = payload.snn;
 }
 
 async function pauseSnn() {
-  const payload = await postSnn("/api/snn/pause");
+  const payload = await postSnn("/api/snn/pause", { tick: nextObservedTick() });
   if (payload?.snn) viewer.snnStatus = payload.snn;
 }
 

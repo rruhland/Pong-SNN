@@ -71,7 +71,9 @@
   function start(sim) {
     if (!sim.running) {
       sim.running = true;
-      resetBall(sim, sim.rng() < 0.5 ? -1 : 1);
+      if (sim.ball.vx === 0 && sim.ball.vy === 0) {
+        resetBall(sim, sim.rng() < 0.5 ? -1 : 1);
+      }
     }
   }
 
