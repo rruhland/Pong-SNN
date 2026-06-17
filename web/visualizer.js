@@ -31,7 +31,9 @@ const viewer = {
   seed: null,
   stateChannel: "BroadcastChannel" in window ? new BroadcastChannel("pong-snn-state") : null,
   pollMs: 16,
-  backendPollMs: 16,
+  backendPollMs: 8,
+  backendPollInFlight: false,
+  lastBackendPollAt: -Infinity,
   source: "waiting",
   eventTrail: [],
   trailMs: Number(trailInput?.value || 120),
@@ -371,7 +373,7 @@ async function pollSession() {
     if (response.ok) {
       const session = await response.json();
       viewer.pollMs = session.settings?.pollMs || viewer.pollMs;
-      viewer.backendPollMs = session.settings?.statePushMs || viewer.backendPollMs;
+      viewer.backendPollMs = Math.min(viewer.backendPollMs, session.settings?.statePushMs || viewer.backendPollMs);
       const needsReset =
         viewer.resetToken === null ||
         viewer.resetToken !== session.resetToken ||
@@ -389,15 +391,23 @@ async function pollSession() {
   }
 }
 
-async function pollBackendState() {
+async function pollBackendStateOnce() {
+  if (viewer.backendPollInFlight) return;
+  viewer.backendPollInFlight = true;
   try {
     const response = await fetch("/api/state", { cache: "no-store" });
     if (response.ok) {
       acceptState(await response.json(), "backend");
     }
   } finally {
-    window.setTimeout(pollBackendState, viewer.backendPollMs);
+    viewer.backendPollInFlight = false;
   }
+}
+
+function maybePollBackendState(now = performance.now()) {
+  if (now - viewer.lastBackendPollAt < viewer.backendPollMs) return;
+  viewer.lastBackendPollAt = now;
+  pollBackendStateOnce();
 }
 
 async function resetGame() {
@@ -502,6 +512,7 @@ async function pollSnnStatus() {
 }
 
 function frame() {
+  maybePollBackendState();
   render();
   requestAnimationFrame(frame);
 }
@@ -530,7 +541,7 @@ window.addEventListener("resize", resize);
 window.__pongViewer = viewer;
 resize();
 pollSession();
-pollBackendState();
+pollBackendStateOnce();
 pollSnnStatus();
 pollSaves();
 requestAnimationFrame(frame);
