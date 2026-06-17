@@ -53,7 +53,57 @@ function normalizeState(rawState, source) {
       leftY: Number(paddles.leftY ?? (settings.height - settings.paddleHeight) / 2),
       rightY: Number(paddles.rightY ?? (settings.height - settings.paddleHeight) / 2),
     },
+    eventCamera: normalizeEventCamera(rawState.eventCamera, settings),
   };
+}
+
+function normalizeEventCamera(rawEventCamera, settings) {
+  if (!rawEventCamera || !Array.isArray(rawEventCamera.pixels)) return null;
+  const width = Math.max(1, Math.floor(Number(rawEventCamera.width || settings.width)));
+  const height = Math.max(1, Math.floor(Number(rawEventCamera.height || settings.height)));
+  const maxIndex = width * height;
+  const pixels = rawEventCamera.pixels
+    .map((pixel) => Number(pixel))
+    .filter((pixel) => Number.isInteger(pixel) && pixel >= 0 && pixel < maxIndex);
+
+  return {
+    ...rawEventCamera,
+    width,
+    height,
+    pixels,
+    count: pixels.length,
+  };
+}
+
+function drawEventOverlay(ctx, canvasWidth, canvasHeight, eventCamera) {
+  if (!eventCamera || eventCamera.pixels.length === 0) return;
+  const scaleX = canvasWidth / eventCamera.width;
+  const scaleY = canvasHeight / eventCamera.height;
+  const flushRun = (start, end, row) => {
+    const x = start - row * eventCamera.width;
+    ctx.fillRect(x * scaleX, row * scaleY, (end - start + 1) * scaleX, scaleY);
+  };
+  let runStart = -1;
+  let runEnd = -1;
+  let runRow = -1;
+
+  ctx.fillStyle = "rgba(255, 0, 0, .25)";
+  for (const pixel of eventCamera.pixels) {
+    const row = Math.floor(pixel / eventCamera.width);
+    if (runStart >= 0 && row === runRow && pixel === runEnd + 1) {
+      runEnd = pixel;
+      continue;
+    }
+    if (runStart >= 0) {
+      flushRun(runStart, runEnd, runRow);
+    }
+    runStart = pixel;
+    runEnd = pixel;
+    runRow = row;
+  }
+  if (runStart >= 0) {
+    flushRun(runStart, runEnd, runRow);
+  }
 }
 
 function acceptState(rawState, source) {
@@ -105,6 +155,7 @@ function render() {
   }
 
   PongCore.drawState(ctx, canvas.clientWidth, canvas.clientHeight, viewer.latestState);
+  drawEventOverlay(ctx, canvas.clientWidth, canvas.clientHeight, viewer.latestState.eventCamera);
   scoreEl.textContent = `${viewer.latestState.score.left}:${viewer.latestState.score.right}`;
   viewer.lastRenderedFrameSeq = viewer.latestState.frameSeq;
 }

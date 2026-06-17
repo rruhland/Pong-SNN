@@ -38,6 +38,7 @@ const state = {
   appliedEventSeq: 0,
   frameSeq: 0,
   renderedAt: 0,
+  eventCamera: null,
   source: "backend",
   updatedAt: Date.now() / 1000,
 };
@@ -107,6 +108,32 @@ function parseTick(value, fallback) {
 
 function copyState() {
   return JSON.parse(JSON.stringify({ ...state, tick: state.authoritativeTick, settings }));
+}
+
+function normalizeEventCamera(value) {
+  if (!value || typeof value !== "object") return null;
+  const width = Number.parseInt(value.width, 10);
+  const height = Number.parseInt(value.height, 10);
+  if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+    return null;
+  }
+  const maxIndex = width * height;
+  const pixels = Array.isArray(value.pixels)
+    ? value.pixels
+        .map((pixel) => Number.parseInt(pixel, 10))
+        .filter((pixel) => Number.isInteger(pixel) && pixel >= 0 && pixel < maxIndex)
+    : [];
+  return {
+    width,
+    height,
+    tick: Number.parseInt(value.tick ?? state.authoritativeTick, 10) || 0,
+    frameSeq: Number.parseInt(value.frameSeq ?? state.frameSeq, 10) || 0,
+    resetToken: value.resetToken,
+    renderedAt: Number(value.renderedAt ?? state.renderedAt) || 0,
+    source: typeof value.source === "string" ? value.source : "game",
+    pixels,
+    count: pixels.length,
+  };
 }
 
 function sessionPayload() {
@@ -189,6 +216,7 @@ function resetGameState(resetScore = true) {
   state.appliedEventSeq = 0;
   state.frameSeq = 0;
   state.renderedAt = 0;
+  state.eventCamera = null;
   state.source = "backend";
   state.updatedAt = Date.now() / 1000;
 }
@@ -274,6 +302,9 @@ async function handlePost(request, response, route) {
       }
       if (Number.isFinite(Number(body.renderedAt))) {
         state.renderedAt = Number(body.renderedAt);
+      }
+      if ("eventCamera" in body) {
+        state.eventCamera = normalizeEventCamera(body.eventCamera);
       }
       if (typeof body.source === "string") {
         state.source = body.source;

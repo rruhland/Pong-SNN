@@ -3,6 +3,7 @@ const ctx = canvas.getContext("2d");
 
 const client = {
   sim: PongCore.createSimulation(),
+  eventCamera: PongCore.createEventCamera(),
   accumulator: 0,
   lastTime: performance.now(),
   mode: "human",
@@ -58,7 +59,7 @@ function broadcastEvent(event) {
 }
 
 function frameState(now = performance.now()) {
-  return {
+  const state = {
     ...PongCore.snapshot(client.sim),
     sessionId: client.sessionId,
     resetToken: client.resetToken,
@@ -68,6 +69,12 @@ function frameState(now = performance.now()) {
     renderedAt: now,
     source: "game",
   };
+  state.eventCamera = PongCore.captureEventFrame(client.eventCamera, state, {
+    resetToken: client.resetToken,
+    frameSeq: client.frameSeq,
+    renderedAt: now,
+  });
+  return state;
 }
 
 function broadcastState(state) {
@@ -150,6 +157,7 @@ async function pollSession() {
       client.currentDirection = 0;
       client.lastPublishedDirection = 0;
       client.startRequested = false;
+      client.eventCamera = PongCore.createEventCamera();
       client.frameSeq = 0;
       client.accumulator = 0;
       PongCore.resetSimulation(client.sim, session.seed);

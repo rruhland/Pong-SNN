@@ -38,6 +38,8 @@ class FakeBroadcastChannel {
 
 function fakeContext() {
   const listeners = new Map();
+  const drawCalls = [];
+  let fillStyle = "";
   const canvas = {
     clientWidth: 800,
     clientHeight: 450,
@@ -46,9 +48,13 @@ function fakeContext() {
     getContext() {
       return {
         clearRect() {},
-        fillRect() {},
+        fillRect(...args) {
+          drawCalls.push({ fillStyle, args });
+        },
         setTransform() {},
-        set fillStyle(_value) {},
+        set fillStyle(value) {
+          fillStyle = value;
+        },
       };
     },
   };
@@ -96,6 +102,7 @@ function fakeContext() {
   };
 
   context.window = {
+    __drawCalls: drawCalls,
     devicePixelRatio: 1,
     innerWidth: 800,
     innerHeight: 450,
@@ -130,6 +137,7 @@ vm.runInContext(gameSource, game, { filename: "game.js" });
 
 vm.runInContext(
   `
+  PongCore.start(client.sim);
   for (let i = 0; i < 12; i += 1) {
     PongCore.step(client.sim, []);
     client.frameSeq += 1;
@@ -150,9 +158,18 @@ assert.strictEqual(latestVisualizerFrame.tick, latestGameFrame.tick);
 assert.strictEqual(asJson(latestVisualizerFrame.score), asJson(latestGameFrame.score));
 assert.strictEqual(asJson(latestVisualizerFrame.ball), asJson(latestGameFrame.ball));
 assert.strictEqual(asJson(latestVisualizerFrame.paddles), asJson(latestGameFrame.paddles));
+assert(latestGameFrame.eventCamera, "game frame should include event camera output");
+assert(Array.isArray(latestGameFrame.eventCamera.pixels), "event camera pixels should be an array");
+assert(latestGameFrame.eventCamera.pixels.length > 0, "moving game objects should emit event pixels");
+assert.strictEqual(asJson(latestVisualizerFrame.eventCamera), asJson(latestGameFrame.eventCamera));
 
+visualizer.window.__drawCalls.length = 0;
 vm.runInContext("for (let i = 0; i < 10; i += 1) render();", visualizer);
 assert.strictEqual(visualizer.window.__pongViewerState.frameSeq, latestGameFrame.frameSeq);
+assert(
+  visualizer.window.__drawCalls.some((call) => call.fillStyle === "#ff0000"),
+  "visualizer should draw event camera pixels as a red overlay"
+);
 
 vm.runInContext(
   `

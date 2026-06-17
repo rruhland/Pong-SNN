@@ -32,6 +32,12 @@ mirror-only: it never advances its own Pong simulation, so a virtual event camer
 should attach to the game page while the visualizer shows that same live game
 state in real time.
 
+Each published game frame now includes `eventCamera`, a game-side virtual event
+camera payload. `eventCamera.pixels` is a list of changed logical game-pixel
+indices, encoded as `y * eventCamera.width + x`. The visualizer draws those
+events as opaque red pixels over the mirrored Pong view; it does not sample its
+own canvas to generate events.
+
 ## Controls
 
 The right paddle defaults to human keyboard control:

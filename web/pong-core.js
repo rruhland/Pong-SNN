@@ -220,6 +220,90 @@
     rect(state.ball.x, state.ball.y, settings.ballSize, settings.ballSize);
   }
 
+  function rasterizeState(state) {
+    const stateSettings = state.settings || {};
+    const settings = { ...DEFAULT_SETTINGS, ...stateSettings };
+    const width = Math.max(1, Math.floor(settings.width));
+    const height = Math.max(1, Math.floor(settings.height));
+    const mask = new Uint8Array(width * height);
+    const paddles = state.paddles || {};
+    const ball = state.ball || {};
+    const markRect = (x, y, rectWidth, rectHeight) => {
+      const left = clamp(Math.floor(x), 0, width);
+      const right = clamp(Math.ceil(x + rectWidth), 0, width);
+      const top = clamp(Math.floor(y), 0, height);
+      const bottom = clamp(Math.ceil(y + rectHeight), 0, height);
+      if (left >= right || top >= bottom) return;
+      for (let row = top; row < bottom; row += 1) {
+        mask.fill(1, row * width + left, row * width + right);
+      }
+    };
+
+    for (let y = 0; y < settings.height; y += 24) {
+      markRect(settings.width / 2 - 1, y, 2, 12);
+    }
+    markRect(24, Number(paddles.leftY ?? (settings.height - settings.paddleHeight) / 2), settings.paddleWidth, settings.paddleHeight);
+    markRect(
+      settings.width - 34,
+      Number(paddles.rightY ?? (settings.height - settings.paddleHeight) / 2),
+      settings.paddleWidth,
+      settings.paddleHeight
+    );
+    markRect(
+      Number(ball.x ?? settings.width / 2),
+      Number(ball.y ?? settings.height / 2),
+      settings.ballSize,
+      settings.ballSize
+    );
+
+    return { width, height, mask };
+  }
+
+  function createEventCamera() {
+    return {
+      width: 0,
+      height: 0,
+      resetToken: undefined,
+      previousMask: null,
+    };
+  }
+
+  function captureEventFrame(camera, state, metadata = {}) {
+    const raster = rasterizeState(state);
+    const resetToken = metadata.resetToken;
+    const pixels = [];
+    const changedBaseline =
+      !camera.previousMask ||
+      camera.width !== raster.width ||
+      camera.height !== raster.height ||
+      camera.resetToken !== resetToken;
+
+    if (!changedBaseline) {
+      for (let index = 0; index < raster.mask.length; index += 1) {
+        if (raster.mask[index] !== camera.previousMask[index]) {
+          pixels.push(index);
+        }
+      }
+    }
+
+    camera.width = raster.width;
+    camera.height = raster.height;
+    camera.resetToken = resetToken;
+    camera.previousMask = raster.mask;
+
+    return {
+      width: raster.width,
+      height: raster.height,
+      tick: Number(state.tick ?? metadata.tick ?? 0),
+      frameSeq: Number(metadata.frameSeq ?? state.frameSeq ?? state.tick ?? 0),
+      resetToken,
+      renderedAt: metadata.renderedAt,
+      source: "game",
+      pixels,
+      count: pixels.length,
+    };
+  }
+
   function snapshot(sim) {
     return {
       tick: sim.tick,
@@ -248,6 +332,9 @@
     step,
     draw,
     drawState,
+    rasterizeState,
+    createEventCamera,
+    captureEventFrame,
     snapshot,
   };
 })();

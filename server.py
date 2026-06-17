@@ -45,6 +45,7 @@ STATE = {
     "appliedEventSeq": 0,
     "frameSeq": 0,
     "renderedAt": 0,
+    "eventCamera": None,
     "source": "backend",
     "updatedAt": time.time(),
 }
@@ -97,6 +98,38 @@ def session_payload():
         "latestEventSeq": STATE["eventSeq"],
         "latestInputSeq": STATE["inputSeq"],
         "settings": SETTINGS,
+    }
+
+
+def normalize_event_camera(value):
+    if not isinstance(value, dict):
+        return None
+    try:
+        width = int(value.get("width"))
+        height = int(value.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    max_index = width * height
+    pixels = []
+    for pixel in value.get("pixels", []):
+        try:
+            numeric = int(pixel)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= numeric < max_index:
+            pixels.append(numeric)
+    return {
+        "width": width,
+        "height": height,
+        "tick": int(value.get("tick", STATE["authoritativeTick"]) or 0),
+        "frameSeq": int(value.get("frameSeq", STATE["frameSeq"]) or 0),
+        "resetToken": value.get("resetToken"),
+        "renderedAt": float(value.get("renderedAt", STATE["renderedAt"]) or 0),
+        "source": value.get("source") if isinstance(value.get("source"), str) else "game",
+        "pixels": pixels,
+        "count": len(pixels),
     }
 
 
@@ -159,6 +192,7 @@ def reset_game_state(reset_score=True):
     STATE["appliedEventSeq"] = 0
     STATE["frameSeq"] = 0
     STATE["renderedAt"] = 0
+    STATE["eventCamera"] = None
     STATE["source"] = "backend"
     STATE["updatedAt"] = time.time()
 
@@ -305,6 +339,8 @@ class PongHandler(BaseHTTPRequestHandler):
                 STATE["frameSeq"] = max(STATE["frameSeq"], int(body["frameSeq"]))
             if "renderedAt" in body:
                 STATE["renderedAt"] = float(body["renderedAt"])
+            if "eventCamera" in body:
+                STATE["eventCamera"] = normalize_event_camera(body["eventCamera"])
             if isinstance(body.get("source"), str):
                 STATE["source"] = body["source"]
             STATE["updatedAt"] = time.time()
