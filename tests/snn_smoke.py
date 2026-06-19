@@ -39,6 +39,10 @@ def main():
         assert autonomous_state["running"] is True
         assert autonomous_state["tick"] > 0
         assert autonomous_state["eventCamera"]["source"] == "backend"
+        speed = request_json(base_url, "/api/sim-speed", {"speed": 1.75})
+        assert speed["settings"]["simulationSpeed"] == 1.75
+        clamped_speed = request_json(base_url, "/api/sim-speed", {"speed": 99})
+        assert clamped_speed["settings"]["simulationSpeed"] == clamped_speed["settings"]["maxSimulationSpeed"]
         status = request_json(base_url, "/api/snn/status")
         assert status["activity"]["eventCount"] > 0
         assert status["activity"]["spikes"]["hidden1"] > 0

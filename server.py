@@ -25,6 +25,9 @@ SETTINGS = {
     "pollMs": 16,
     "statePushMs": 16,
     "fixedDt": 1 / 60,
+    "simulationSpeed": 1.0,
+    "minSimulationSpeed": 0.25,
+    "maxSimulationSpeed": 4.0,
 }
 
 STATE = {
@@ -87,6 +90,14 @@ def parse_tick(value, fallback):
     if numeric < 0:
         raise ValueError("tick must be a non-negative integer")
     return numeric
+
+
+def parse_simulation_speed(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("speed must be a number")
+    return clamp(numeric, SETTINGS["minSimulationSpeed"], SETTINGS["maxSimulationSpeed"])
 
 
 def read_json(handler):
@@ -387,9 +398,10 @@ def capture_event_frame():
 
 def backend_step():
     apply_due_events()
-    update_paddles(SETTINGS["fixedDt"])
+    physics_dt = SETTINGS["fixedDt"] * float(SETTINGS.get("simulationSpeed", 1.0))
+    update_paddles(physics_dt)
     if STATE["running"]:
-        update_ball(SETTINGS["fixedDt"])
+        update_ball(physics_dt)
     STATE["authoritativeTick"] += 1
     STATE["frameSeq"] += 1
     STATE["renderedAt"] = time.time() * 1000
@@ -539,6 +551,9 @@ class PongHandler(BaseHTTPRequestHandler):
             if path == "/api/control-mode":
                 self.set_control_mode(body)
                 return
+            if path == "/api/sim-speed":
+                self.set_simulation_speed(body)
+                return
             if path == "/api/input":
                 self.set_api_input(body)
                 return
@@ -579,6 +594,13 @@ class PongHandler(BaseHTTPRequestHandler):
             raise ValueError('mode must be "human" or "api"')
         with STATE_LOCK:
             STATE["mode"] = mode
+            STATE["updatedAt"] = time.time()
+            payload = session_payload()
+        self.send_json(payload)
+
+    def set_simulation_speed(self, body):
+        with STATE_LOCK:
+            SETTINGS["simulationSpeed"] = parse_simulation_speed(body.get("speed"))
             STATE["updatedAt"] = time.time()
             payload = session_payload()
         self.send_json(payload)

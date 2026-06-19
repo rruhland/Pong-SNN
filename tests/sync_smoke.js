@@ -91,6 +91,8 @@ function fakeContext(backendFrame) {
     savedNetworks: { value: "", textContent: "", appendChild() {}, options: [] },
     trailMs: { value: "120", addEventListener() {} },
     trailValue: { textContent: "" },
+    simSpeed: { value: "1", addEventListener() {} },
+    simSpeedValue: { textContent: "" },
     barUp: { style: {} },
     barDown: { style: {} },
     barStay: { style: {} },
@@ -127,7 +129,11 @@ function fakeContext(backendFrame) {
           tick: backendFrame.tick,
           mode: "api",
           running: backendFrame.running,
-          settings: { pollMs: 16, statePushMs: 16 },
+          settings: { pollMs: 16, statePushMs: 16, simulationSpeed: 1 },
+        };
+      } else if (href.includes("/api/sim-speed")) {
+        body = {
+          settings: { pollMs: 16, statePushMs: 16, simulationSpeed: 1.5 },
         };
       } else if (href.includes("/api/snn/status")) {
         body = {
@@ -155,6 +161,7 @@ function fakeContext(backendFrame) {
     performance: { now: () => 1 },
     requestAnimationFrame() {},
     setTimeout() {},
+    clearTimeout() {},
   };
 
   context.window = {
@@ -175,6 +182,7 @@ function fakeContext(backendFrame) {
       }
     },
     setTimeout: context.setTimeout,
+    clearTimeout: context.clearTimeout,
     requestAnimationFrame: context.requestAnimationFrame,
   };
   context.globalThis = context;

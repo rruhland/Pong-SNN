@@ -26,6 +26,8 @@ http://127.0.0.1:8000/visualizer
 
 The visualizer is the training controller. Start, pause, reset, save, and load
 can all be driven from that page without opening the standalone Pong page.
+The speed slider changes backend Pong physics speed while keeping the simulation
+tick cadence fixed.
 
 The standalone game page at http://127.0.0.1:8000/ is a mirror of backend state.
 You can open it at any time and it will show the same tick, ball, paddles, score,
@@ -109,6 +111,12 @@ Read backend state:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/state
+```
+
+Adjust backend physics speed:
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/sim-speed -ContentType "application/json" -Body '{"speed":1.75}'
 ```
 
 Read session metadata:

@@ -1,4 +1,4 @@
 __pycache__/
 *.py[cod]
 logs/
-network_saves/
+# network_saves/

@@ -117,14 +117,19 @@ input:focus-visible {
   padding: 8px;
 }
 
-.trail-control {
+.trail-control,
+.speed-control {
   display: grid;
   gap: 8px;
-  margin-top: auto;
   font-size: 20px;
 }
 
-.trail-control input {
+.trail-control {
+  margin-top: auto;
+}
+
+.trail-control input,
+.speed-control input {
   width: 100%;
   accent-color: #111;
 }

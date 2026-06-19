@@ -9,6 +9,8 @@ const loadButton = document.getElementById("loadNetwork");
 const savesSelect = document.getElementById("savedNetworks");
 const trailInput = document.getElementById("trailMs");
 const trailValue = document.getElementById("trailValue");
+const simSpeedInput = document.getElementById("simSpeed");
+const simSpeedValue = document.getElementById("simSpeedValue");
 const networkCanvas = document.getElementById("networkDesign");
 const networkCtx = networkCanvas?.getContext("2d");
 const outputBars = {
@@ -41,6 +43,8 @@ const viewer = {
   source: "waiting",
   eventTrail: [],
   trailMs: Number(trailInput?.value || 120),
+  simulationSpeed: Number(simSpeedInput?.value || 1),
+  speedPostTimer: null,
   lastTrailKey: null,
   snnStatus: null,
   snnPollMs: 120,
@@ -245,6 +249,17 @@ function setBar(element, value) {
   element.style.width = `${percent.toFixed(1)}%`;
 }
 
+function setSpeedControl(value) {
+  const numeric = Math.max(0.25, Math.min(4, Number(value || 1)));
+  viewer.simulationSpeed = numeric;
+  if (simSpeedInput && Math.abs(Number(simSpeedInput.value) - numeric) > 0.001) {
+    simSpeedInput.value = String(numeric);
+  }
+  if (simSpeedValue) {
+    simSpeedValue.textContent = `${numeric.toFixed(2)}x`;
+  }
+}
+
 function renderSnn() {
   const status = viewer.snnStatus;
   const activity = status?.activity;
@@ -404,6 +419,9 @@ async function pollSession() {
       const session = await response.json();
       viewer.pollMs = session.settings?.pollMs || viewer.pollMs;
       viewer.backendPollMs = Math.min(viewer.backendPollMs, session.settings?.statePushMs || viewer.backendPollMs);
+      if (session.settings?.simulationSpeed !== undefined) {
+        setSpeedControl(session.settings.simulationSpeed);
+      }
       const needsReset =
         viewer.resetToken === null ||
         viewer.resetToken !== session.resetToken ||
@@ -463,6 +481,34 @@ async function postSnn(path, body = {}) {
   });
   if (!response.ok) return null;
   return response.json();
+}
+
+async function postSimulationSpeed(speed) {
+  const response = await fetch("/api/sim-speed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ speed }),
+    cache: "no-store",
+  });
+  if (!response.ok) return;
+  const payload = await response.json();
+  if (payload?.settings?.simulationSpeed !== undefined) {
+    setSpeedControl(payload.settings.simulationSpeed);
+  }
+}
+
+function scheduleSpeedPost() {
+  const speed = Number(simSpeedInput?.value || 1);
+  setSpeedControl(speed);
+  if (viewer.speedPostTimer) {
+    window.clearTimeout(viewer.speedPostTimer);
+  }
+  viewer.speedPostTimer = window.setTimeout(() => {
+    viewer.speedPostTimer = null;
+    postSimulationSpeed(viewer.simulationSpeed).catch(() => {
+      // Session polling will restore the last accepted backend value.
+    });
+  }, 80);
 }
 
 function nextObservedTick() {
@@ -560,6 +606,9 @@ if (trailInput) {
     }
     pruneEventTrail();
   });
+}
+if (simSpeedInput) {
+  simSpeedInput.addEventListener("input", scheduleSpeedPost);
 }
 if (viewer.stateChannel) {
   viewer.stateChannel.addEventListener("message", (event) => {
