@@ -28,6 +28,10 @@ const hitMissReadoutEl = document.getElementById("hitMissReadout");
 const learningReadoutEl = document.getElementById("learningReadout");
 const deviceEl = document.getElementById("device");
 const trainStateEl = document.getElementById("trainState");
+const worldStreamEl = document.getElementById("worldStream");
+const eventStreamEl = document.getElementById("eventStream");
+const snnStreamEl = document.getElementById("snnStream");
+const actionStreamEl = document.getElementById("actionStream");
 
 const viewer = {
   latestState: null,
@@ -48,6 +52,8 @@ const viewer = {
   lastTrailKey: null,
   snnStatus: null,
   snnPollMs: 120,
+  streams: null,
+  latestAction: null,
 };
 
 function resize() {
@@ -304,7 +310,37 @@ function renderSnn() {
   if (trainStateEl) {
     trainStateEl.textContent = status?.training && !status?.paused ? "training" : "paused";
   }
+  renderStreams();
   drawNetworkDesign();
+}
+
+function renderStreams() {
+  const state = viewer.latestState;
+  const eventCamera = state?.eventCamera;
+  const streams = viewer.streams || {};
+  const snnRuntime = viewer.snnStatus?.runtime || streams.snn || {};
+  const action = viewer.latestAction;
+  if (worldStreamEl) {
+    const source = state?.source || streams.world?.source || "waiting";
+    const frameSeq = state?.frameSeq ?? streams.world?.frameSeq ?? 0;
+    worldStreamEl.textContent = `world: ${source} frame ${frameSeq}`;
+  }
+  if (eventStreamEl) {
+    const count = eventCamera?.count ?? streams.eventCamera?.count ?? 0;
+    const frameSeq = eventCamera?.frameSeq ?? streams.eventCamera?.frameSeq ?? 0;
+    eventStreamEl.textContent = `events: ${count} changes frame ${frameSeq}`;
+  }
+  if (snnStreamEl) {
+    const samples = snnRuntime.samples ?? 0;
+    const lastFrameSeq = snnRuntime.lastFrameSeq ?? 0;
+    snnStreamEl.textContent = `snn: ${samples} samples through frame ${lastFrameSeq}`;
+  }
+  if (actionStreamEl) {
+    const direction = action?.direction ?? viewer.snnStatus?.lastCommand ?? 0;
+    const label = direction < 0 ? "up" : direction > 0 ? "down" : "hold";
+    const seq = action?.seq ?? 0;
+    actionStreamEl.textContent = `action: ${label} seq ${seq}`;
+  }
 }
 
 function formatSigned(value, digits) {
@@ -422,6 +458,8 @@ async function pollSession() {
       if (session.settings?.simulationSpeed !== undefined) {
         setSpeedControl(session.settings.simulationSpeed);
       }
+      viewer.streams = session.streams || viewer.streams;
+      viewer.latestAction = session.latestAction || viewer.latestAction;
       const needsReset =
         viewer.resetToken === null ||
         viewer.resetToken !== session.resetToken ||

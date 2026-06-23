@@ -135,11 +135,17 @@ input:focus-visible {
 }
 
 .backend-readout,
+.stream-readout,
 .spike-stats {
   display: grid;
   gap: 5px;
   font-size: 14px;
   line-height: 1.25;
+}
+
+.stream-readout {
+  border-top: 3px solid #111;
+  padding-top: 12px;
 }
 
 .game-panel {

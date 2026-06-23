@@ -182,11 +182,13 @@
     }
   }
 
-  function step(sim, events = []) {
+  function step(sim, events = [], options = {}) {
     applyTimelineEvents(sim, events);
-    updatePaddles(sim, sim.settings.fixedDt);
+    const speed = Math.max(0.25, Math.min(4, Number(options.simulationSpeed ?? sim.settings.simulationSpeed ?? 1)));
+    const dt = sim.settings.fixedDt * speed;
+    updatePaddles(sim, dt);
     if (sim.running) {
-      updateBall(sim, sim.settings.fixedDt);
+      updateBall(sim, dt);
     }
     sim.tick += 1;
   }

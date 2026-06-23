@@ -1,16 +1,55 @@
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 
+const FRAME_MS = 1000 / 60;
+const MAX_STEPS_PER_FRAME = 5;
+
 const client = {
-  latestState: null,
+  sim: null,
+  eventCamera: null,
   sessionId: null,
   resetToken: null,
+  seed: null,
   keys: new Set(),
+  pendingEvents: [],
+  lastEventSeq: 0,
   lastPublishedDirection: 0,
   stateChannel: "BroadcastChannel" in window ? new BroadcastChannel("pong-snn-state") : null,
-  pollMs: 16,
+  pollMs: 120,
+  eventPollMs: 8,
+  postMs: 16,
+  simulationSpeed: 1,
+  frameSeq: 0,
   frameHistory: [],
+  pendingWorldFrames: new Map(),
+  postingObservation: false,
+  lastPostAt: -Infinity,
+  lastFrameAt: null,
+  accumulatorMs: 0,
 };
+
+function createLocalSimulation(seed = 1, settings = PongCore.DEFAULT_SETTINGS) {
+  client.seed = seed;
+  client.sim = PongCore.createSimulation({ seed, settings });
+  if (!client.eventCamera) {
+    client.eventCamera = EventCamera.create({
+      width: settings.width,
+      height: settings.height,
+      source: "event-camera",
+      onEventCamera: acceptEventCamera,
+    });
+  } else {
+    client.eventCamera.width = settings.width;
+    client.eventCamera.height = settings.height;
+    client.eventCamera.reset();
+  }
+  client.pendingEvents = [];
+  client.lastEventSeq = 0;
+  client.lastPublishedDirection = 0;
+  client.frameSeq = 0;
+  client.frameHistory = [];
+  client.pendingWorldFrames.clear();
+}
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
@@ -28,82 +67,93 @@ function currentKeyboardDirection() {
   return 0;
 }
 
-function normalizeState(rawState) {
-  if (!rawState) return null;
-  const settings = { ...PongCore.DEFAULT_SETTINGS, ...(rawState.settings || {}) };
-  const paddles = rawState.paddles || {};
-  const ball = rawState.ball || {};
-  const score = rawState.score || {};
-  const tick = Number(rawState.tick ?? rawState.authoritativeTick ?? 0);
+function normalizeSessionSettings(settings) {
+  return { ...PongCore.DEFAULT_SETTINGS, ...(settings || {}) };
+}
+
+function mergeSettings(settings) {
+  if (!client.sim) return;
+  client.sim.settings = normalizeSessionSettings(settings);
+  client.sim.left.speed = 320;
+  client.sim.right.speed = 360;
+  client.sim.left.x = 24;
+  client.sim.right.x = client.sim.settings.width - 34;
+  client.simulationSpeed = Number(settings?.simulationSpeed ?? client.simulationSpeed ?? 1);
+}
+
+function resetFromSession(session) {
+  const settings = normalizeSessionSettings(session.settings);
+  client.sessionId = session.sessionId;
+  client.resetToken = session.resetToken;
+  createLocalSimulation(Number(session.seed || 1), settings);
+  client.pollMs = Number(session.settings?.pollMs || client.pollMs);
+  client.eventPollMs = Number(session.settings?.eventPollMs || client.eventPollMs);
+  client.postMs = Number(session.settings?.statePushMs || client.postMs);
+  client.simulationSpeed = Number(session.settings?.simulationSpeed || 1);
+}
+
+function normalizeEvent(rawEvent) {
+  if (!rawEvent || typeof rawEvent !== "object") return null;
+  const tick = Number(rawEvent.tick ?? 0);
+  const type = rawEvent.type || "input";
+  if (!Number.isFinite(tick) || !["start", "pause", "input"].includes(type)) return null;
   return {
-    ...rawState,
-    tick,
-    authoritativeTick: Number(rawState.authoritativeTick ?? tick),
-    frameSeq: Number(rawState.frameSeq ?? tick),
-    settings,
-    running: Boolean(rawState.running),
-    score: {
-      left: Number(score.left ?? 0),
-      right: Number(score.right ?? 0),
-    },
-    ball: {
-      x: Number(ball.x ?? settings.width / 2),
-      y: Number(ball.y ?? settings.height / 2),
-      vx: Number(ball.vx ?? 0),
-      vy: Number(ball.vy ?? 0),
-    },
-    paddles: {
-      leftY: Number(paddles.leftY ?? (settings.height - settings.paddleHeight) / 2),
-      rightY: Number(paddles.rightY ?? (settings.height - settings.paddleHeight) / 2),
-    },
-    source: rawState.source || "backend",
+    ...rawEvent,
+    type,
+    tick: Math.max(0, Math.floor(tick)),
+    seq: Number(rawEvent.seq || 0),
+    direction: type === "input" ? Math.max(-1, Math.min(1, Number(rawEvent.direction || 0))) : undefined,
   };
 }
 
-function broadcastState(state) {
-  client.frameHistory.push(state);
-  if (client.frameHistory.length > 180) {
-    client.frameHistory.shift();
+function queueEvents(events) {
+  for (const rawEvent of events || []) {
+    const event = normalizeEvent(rawEvent);
+    if (!event) continue;
+    if (event.seq > 0) {
+      client.lastEventSeq = Math.max(client.lastEventSeq, event.seq);
+    }
+    client.pendingEvents.push(event);
   }
-  if (client.stateChannel) {
-    client.stateChannel.postMessage(state);
-  }
-  window.__pongLatestFrame = state;
-  window.__pongFrameHistory = client.frameHistory;
+  client.pendingEvents.sort((a, b) => (a.tick - b.tick) || ((a.seq || 0) - (b.seq || 0)));
 }
 
-function acceptState(rawState) {
-  const state = normalizeState(rawState);
-  if (!state) return;
-  const isReset = state.resetToken !== undefined && state.resetToken !== client.resetToken;
-  const isNewSession = client.sessionId && state.sessionId && state.sessionId !== client.sessionId;
-  if (
-    client.latestState &&
-    !isReset &&
-    !isNewSession &&
-    state.frameSeq < client.latestState.frameSeq &&
-    state.tick <= client.latestState.tick
-  ) {
-    return;
-  }
-  client.latestState = state;
-  client.sessionId = state.sessionId || client.sessionId;
-  client.resetToken = state.resetToken ?? client.resetToken;
-  broadcastState(state);
-}
-
-async function pollState() {
+async function pollSession() {
   try {
-    const response = await fetch("/api/state", { cache: "no-store" });
+    const response = await fetch("/api/session", { cache: "no-store" });
     if (response.ok) {
-      const state = await response.json();
-      client.pollMs = state.settings?.pollMs || client.pollMs;
-      acceptState(state);
+      const session = await response.json();
+      const isReset =
+        !client.sim ||
+        client.sessionId !== session.sessionId ||
+        client.resetToken !== session.resetToken;
+      if (isReset) {
+        resetFromSession(session);
+      } else {
+        mergeSettings(session.settings);
+        client.pollMs = Number(session.settings?.pollMs || client.pollMs);
+        client.eventPollMs = Number(session.settings?.eventPollMs || client.eventPollMs);
+        client.postMs = Number(session.settings?.statePushMs || client.postMs);
+      }
     }
   } catch {
-    // The canvas remains on the last good backend frame.
+    // The world keeps running locally if the stream server is briefly unavailable.
   } finally {
-    window.setTimeout(pollState, client.pollMs);
+    window.setTimeout(pollSession, client.pollMs);
+  }
+}
+
+async function pollEvents() {
+  try {
+    const response = await fetch(`/api/events?sinceSeq=${client.lastEventSeq}`, { cache: "no-store" });
+    if (response.ok) {
+      const payload = await response.json();
+      queueEvents(payload.events || []);
+    }
+  } catch {
+    // Hold the last actuator direction until the event stream returns.
+  } finally {
+    window.setTimeout(pollEvents, client.eventPollMs);
   }
 }
 
@@ -121,17 +171,27 @@ async function postJson(path, body = {}) {
   }
 }
 
+function localEvent(type, body = {}) {
+  return {
+    localId: `${type}:${performance.now()}:${Math.random()}`,
+    type,
+    tick: Math.floor(client.sim?.tick || 0),
+    ...body,
+  };
+}
+
 async function startBackendGame() {
-  const tick = Number(client.latestState?.tick ?? 0);
-  await postJson("/api/start", { tick: Number.isFinite(tick) ? Math.floor(tick) + 1 : undefined });
+  if (!client.sim) return;
+  queueEvents([localEvent("start")]);
+  await postJson("/api/start", { tick: Math.floor(client.sim.tick) });
 }
 
 async function publishInput(direction, source = "human") {
-  if (direction === client.lastPublishedDirection) return;
+  if (!client.sim || direction === client.lastPublishedDirection) return;
   client.lastPublishedDirection = direction;
-  const tick = Number(client.latestState?.tick ?? 0);
+  queueEvents([localEvent("input", { direction, source })]);
   await postJson("/api/input", {
-    tick: Number.isFinite(tick) ? Math.floor(tick) + 1 : undefined,
+    tick: Math.floor(client.sim.tick),
     direction,
     source,
   });
@@ -141,28 +201,116 @@ function handleInputChange() {
   publishInput(currentKeyboardDirection(), "human");
 }
 
-function render() {
-  const state =
-    client.latestState ||
-    normalizeState({
-      settings: PongCore.DEFAULT_SETTINGS,
-      score: { left: 0, right: 0 },
-      ball: {
-        x: PongCore.DEFAULT_SETTINGS.width / 2,
-        y: PongCore.DEFAULT_SETTINGS.height / 2,
-        vx: 0,
-        vy: 0,
-      },
-      paddles: {
-        leftY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
-        rightY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
-      },
-    });
-  PongCore.drawState(ctx, window.innerWidth, window.innerHeight, state);
+function makeWorldFrame() {
+  const snapshot = PongCore.snapshot(client.sim);
+  const renderedAt = performance.now();
+  return {
+    ...snapshot,
+    sessionId: client.sessionId,
+    resetToken: client.resetToken,
+    seed: client.seed,
+    authoritativeTick: snapshot.tick,
+    frameSeq: client.frameSeq,
+    renderedAt,
+    source: "game-renderer",
+  };
 }
 
-function frame() {
-  render();
+function acceptEventCamera(eventCamera) {
+  const worldFrame = client.pendingWorldFrames.get(eventCamera.frameSeq);
+  if (!worldFrame) return;
+  client.pendingWorldFrames.delete(eventCamera.frameSeq);
+  const state = { ...worldFrame, eventCamera };
+  broadcastState(state);
+  publishObservation(state);
+
+  const minFrameSeq = eventCamera.frameSeq - 12;
+  for (const frameSeq of client.pendingWorldFrames.keys()) {
+    if (frameSeq < minFrameSeq) {
+      client.pendingWorldFrames.delete(frameSeq);
+    }
+  }
+}
+
+function observeWorldFrame(state) {
+  client.pendingWorldFrames.set(state.frameSeq, state);
+  client.eventCamera.observeCanvas(canvas, {
+    width: state.settings.width,
+    height: state.settings.height,
+    tick: state.tick,
+    frameSeq: state.frameSeq,
+    resetToken: state.resetToken,
+    renderedAt: state.renderedAt,
+    source: "event-camera",
+  });
+}
+
+function broadcastState(state) {
+  client.frameHistory.push(state);
+  if (client.frameHistory.length > 180) {
+    client.frameHistory.shift();
+  }
+  if (client.stateChannel) {
+    client.stateChannel.postMessage(state);
+  }
+  window.__pongLatestFrame = state;
+  window.__pongFrameHistory = client.frameHistory;
+}
+
+function publishObservation(state, now = performance.now()) {
+  if (client.postingObservation || now - client.lastPostAt < client.postMs) return;
+  client.postingObservation = true;
+  client.lastPostAt = now;
+  postJson("/api/world/state", state).finally(() => {
+    client.postingObservation = false;
+  });
+}
+
+function stepWorld() {
+  if (!client.sim) {
+    createLocalSimulation(1, PongCore.DEFAULT_SETTINGS);
+  }
+  const due = [];
+  const future = [];
+  for (const event of client.pendingEvents) {
+    if (event.tick <= client.sim.tick) {
+      due.push(event);
+    } else {
+      future.push(event);
+    }
+  }
+  client.pendingEvents = future;
+  PongCore.step(client.sim, due, { simulationSpeed: client.simulationSpeed });
+}
+
+function render() {
+  if (!client.sim) {
+    createLocalSimulation(1, PongCore.DEFAULT_SETTINGS);
+  }
+  PongCore.draw(ctx, window.innerWidth, window.innerHeight, client.sim);
+}
+
+function frame(now) {
+  if (client.lastFrameAt === null) {
+    client.lastFrameAt = now;
+  }
+  client.accumulatorMs += Math.min(250, now - client.lastFrameAt);
+  client.lastFrameAt = now;
+
+  let steps = 0;
+  while (client.accumulatorMs >= FRAME_MS && steps < MAX_STEPS_PER_FRAME) {
+    stepWorld();
+    client.accumulatorMs -= FRAME_MS;
+    steps += 1;
+  }
+
+  if (steps > 0) {
+    render();
+    const state = makeWorldFrame();
+    observeWorldFrame(state);
+    client.frameSeq += 1;
+  }
+
   requestAnimationFrame(frame);
 }
 
@@ -183,7 +331,9 @@ window.addEventListener("keyup", (event) => {
   }
 });
 
+createLocalSimulation(1, PongCore.DEFAULT_SETTINGS);
 resize();
 window.__pongClient = client;
-pollState();
+pollSession();
+pollEvents();
 requestAnimationFrame(frame);

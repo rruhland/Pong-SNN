@@ -22,13 +22,46 @@ SETTINGS = {
     "paddleWidth": 10,
     "paddleHeight": 80,
     "ballSize": 10,
-    "pollMs": 16,
+    "pollMs": 120,
     "statePushMs": 16,
+    "eventPollMs": 8,
     "fixedDt": 1 / 60,
     "simulationSpeed": 1.0,
     "minSimulationSpeed": 0.25,
     "maxSimulationSpeed": 4.0,
+    "snnStepHz": 60,
 }
+
+
+def initial_world_state():
+    return {
+        "sessionId": STATE["sessionId"],
+        "resetToken": STATE["resetToken"],
+        "seed": STATE["seed"],
+        "tick": 0,
+        "authoritativeTick": 0,
+        "frameSeq": 0,
+        "renderedAt": 0,
+        "running": False,
+        "settings": copy.deepcopy(SETTINGS),
+        "score": {"left": 0, "right": 0},
+        "ball": {
+            "x": SETTINGS["width"] / 2,
+            "y": SETTINGS["height"] / 2,
+            "vx": 0,
+            "vy": 0,
+        },
+        "paddles": {
+            "leftY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
+            "rightY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
+        },
+        "appliedInputSeq": 0,
+        "appliedEventSeq": 0,
+        "eventCamera": None,
+        "source": "waiting-for-world",
+        "updatedAt": time.time(),
+    }
+
 
 STATE = {
     "sessionId": "local-1",
@@ -41,29 +74,26 @@ STATE = {
     "events": [],
     "inputSeq": 0,
     "inputEvents": [],
-    "score": {"left": 0, "right": 0},
     "running": False,
-    "ball": {"x": SETTINGS["width"] / 2, "y": SETTINGS["height"] / 2, "vx": 0, "vy": 0},
-    "paddles": {
-        "leftY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
-        "rightY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
-    },
-    "appliedInputSeq": 0,
-    "appliedEventSeq": 0,
-    "frameSeq": 0,
-    "renderedAt": 0,
-    "eventCamera": None,
-    "source": "backend",
+    "latestWorld": None,
+    "latestAction": None,
+    "worldFrameSeq": 0,
+    "worldObservedAt": 0,
     "updatedAt": time.time(),
 }
+STATE["latestWorld"] = initial_world_state()
 
 STATE_LOCK = threading.Lock()
+SNN_LOCK = threading.Lock()
 SNN = PongSNN(SETTINGS["width"], SETTINGS["height"], save_dir=NETWORK_SAVE_ROOT)
-SIM_RNG = random.Random(STATE["seed"])
-EVENT_CAMERA_PREVIOUS = None
-EVENT_CAMERA_TOKEN = None
-SIM_THREAD = None
-SIM_THREAD_LOCK = threading.Lock()
+SNN_THREAD = None
+SNN_THREAD_LOCK = threading.Lock()
+SNN_RUNTIME = {
+    "lastFrameSeq": -1,
+    "lastStepAt": 0.0,
+    "samples": 0,
+    "skippedFrames": 0,
+}
 
 
 def clamp(value, low, high):
@@ -111,6 +141,19 @@ def read_json(handler):
 
 
 def session_payload():
+    latest_world = STATE["latestWorld"] or {}
+    latest_action = STATE["latestAction"] or {
+        "seq": 0,
+        "direction": STATE["apiDirection"],
+        "tick": STATE["authoritativeTick"],
+        "source": "hold",
+        "sessionId": STATE["sessionId"],
+        "emittedAt": 0,
+    }
+    with SNN_LOCK:
+        activity = copy.deepcopy(SNN.activity)
+        training = SNN.training
+        paused = SNN.paused
     return {
         "sessionId": STATE["sessionId"],
         "resetToken": STATE["resetToken"],
@@ -122,17 +165,81 @@ def session_payload():
         "apiDirection": STATE["apiDirection"],
         "latestEventSeq": STATE["eventSeq"],
         "latestInputSeq": STATE["inputSeq"],
-        "settings": SETTINGS,
+        "latestWorldFrameSeq": STATE["worldFrameSeq"],
+        "latestAction": copy.deepcopy(latest_action),
+        "settings": copy.deepcopy(SETTINGS),
+        "streams": {
+            "world": {
+                "source": latest_world.get("source", "waiting-for-world"),
+                "frameSeq": latest_world.get("frameSeq", 0),
+                "observedAt": STATE["worldObservedAt"],
+            },
+            "eventCamera": {
+                "frameSeq": (latest_world.get("eventCamera") or {}).get("frameSeq", 0),
+                "count": (latest_world.get("eventCamera") or {}).get("count", 0),
+            },
+            "snn": {
+                "samples": SNN_RUNTIME["samples"],
+                "lastFrameSeq": SNN_RUNTIME["lastFrameSeq"],
+                "lastStepAt": SNN_RUNTIME["lastStepAt"],
+            },
+        },
         "snn": {
-            "training": SNN.training,
-            "paused": SNN.paused,
-            "winner": SNN.activity["winner"],
-            "direction": SNN.activity["direction"],
+            "training": training,
+            "paused": paused,
+            "winner": activity.get("winner"),
+            "direction": activity.get("direction"),
         },
     }
 
 
-def normalize_event_camera(value):
+def compact_events_locked():
+    min_tick = max(0, STATE["authoritativeTick"] - 1200)
+    if len(STATE["events"]) > 2500:
+        STATE["events"] = [event for event in STATE["events"] if int(event.get("tick", 0)) >= min_tick]
+        STATE["inputEvents"] = [event for event in STATE["events"] if event["type"] == "input"]
+
+
+def add_session_event_locked(body, default_type="input"):
+    event_type = body.get("type", default_type)
+    if event_type not in ("start", "input", "pause"):
+        raise ValueError('type must be "start", "input", or "pause"')
+    tick = parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)
+    event = {
+        "seq": STATE["eventSeq"] + 1,
+        "type": event_type,
+        "tick": tick,
+        "sessionId": STATE["sessionId"],
+        "receivedAt": time.time(),
+    }
+    if event_type == "input":
+        event["direction"] = parse_direction(body.get("direction"))
+        source = body.get("source")
+        event["source"] = source if source in ("human", "snn", "api") else "api"
+        STATE["apiDirection"] = event["direction"]
+        STATE["inputSeq"] = event["seq"]
+        STATE["latestAction"] = {
+            "seq": event["seq"],
+            "direction": event["direction"],
+            "tick": event["tick"],
+            "source": event["source"],
+            "sessionId": STATE["sessionId"],
+            "emittedAt": event["receivedAt"],
+        }
+    STATE["eventSeq"] = event["seq"]
+    STATE["events"].append(event)
+    STATE["events"].sort(key=lambda item: (item["tick"], item["seq"]))
+    STATE["inputEvents"] = [item for item in STATE["events"] if item["type"] == "input"]
+    if event_type == "start":
+        STATE["running"] = True
+    elif event_type == "pause":
+        STATE["running"] = False
+    STATE["updatedAt"] = time.time()
+    compact_events_locked()
+    return event
+
+
+def normalize_event_camera(value, fallback_tick=0, fallback_frame_seq=0, fallback_rendered_at=0):
     if not isinstance(value, dict):
         return None
     try:
@@ -154,296 +261,61 @@ def normalize_event_camera(value):
     return {
         "width": width,
         "height": height,
-        "tick": int(value.get("tick", STATE["authoritativeTick"]) or 0),
-        "frameSeq": int(value.get("frameSeq", STATE["frameSeq"]) or 0),
+        "tick": int(value.get("tick", fallback_tick) or 0),
+        "frameSeq": int(value.get("frameSeq", fallback_frame_seq) or 0),
         "resetToken": value.get("resetToken"),
-        "renderedAt": float(value.get("renderedAt", STATE["renderedAt"]) or 0),
+        "renderedAt": float(value.get("renderedAt", fallback_rendered_at) or 0),
         "source": value.get("source") if isinstance(value.get("source"), str) else "game",
         "pixels": pixels,
         "count": len(pixels),
     }
 
 
-def compact_events():
-    min_tick = max(0, STATE["authoritativeTick"] - 1200)
-    if len(STATE["events"]) > 2500:
-        STATE["events"] = [event for event in STATE["events"] if event["tick"] >= min_tick]
-        STATE["inputEvents"] = [event for event in STATE["events"] if event["type"] == "input"]
-
-
-def add_session_event(body, default_type="input"):
-    event_type = body.get("type", default_type)
-    if event_type not in ("start", "input", "pause"):
-        raise ValueError('type must be "start", "input", or "pause"')
-    tick = parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)
-    event = {
-        "seq": STATE["eventSeq"] + 1,
-        "type": event_type,
-        "tick": tick,
-        "sessionId": STATE["sessionId"],
-        "receivedAt": time.time(),
-    }
-    if event_type == "input":
-        event["direction"] = parse_direction(body.get("direction"))
-        event["source"] = "human" if body.get("source") == "human" else "api"
-        STATE["apiDirection"] = event["direction"]
-        STATE["inputSeq"] = event["seq"]
-    STATE["eventSeq"] = event["seq"]
-    STATE["events"].append(event)
-    STATE["events"].sort(key=lambda item: (item["tick"], item["seq"]))
-    STATE["inputEvents"] = [item for item in STATE["events"] if item["type"] == "input"]
-    if event_type == "start":
-        STATE["running"] = True
-    elif event_type == "pause":
-        STATE["running"] = False
-    STATE["updatedAt"] = time.time()
-    compact_events()
-    return event
-
-
-def apply_snn_to_state():
-    if not STATE.get("eventCamera"):
-        return None
-    if not SNN.training or SNN.paused:
-        return None
-    direction = SNN.step(
-        STATE["eventCamera"],
-        STATE["authoritativeTick"],
-        {**STATE, "settings": SETTINGS},
-    )
-    if direction is None:
-        return None
-    if not SNN.should_emit_command(direction, STATE["authoritativeTick"]):
-        return None
-    return add_session_event(
-        {
-            "type": "input",
-            "tick": STATE["authoritativeTick"] + 1,
-            "direction": direction,
-            "source": "api",
-        },
-        "input",
-    )
-
-
-def reset_ball(direction):
-    angle = SIM_RNG.random() * 0.7 - 0.35
-    speed = float(STATE["ball"].get("speed", 275))
-    STATE["ball"] = {
-        "x": SETTINGS["width"] / 2,
-        "y": SETTINGS["height"] / 2,
-        "vx": math_cos(angle) * speed * direction,
-        "vy": math_sin(angle) * speed,
-        "speed": speed,
-    }
-
-
-def math_sin(value):
-    import math
-
-    return math.sin(value)
-
-
-def math_cos(value):
-    import math
-
-    return math.cos(value)
-
-
-def start_simulation():
-    if not STATE["running"]:
-        STATE["running"] = True
-    if float(STATE["ball"].get("vx", 0)) == 0 and float(STATE["ball"].get("vy", 0)) == 0:
-        reset_ball(-1 if SIM_RNG.random() < 0.5 else 1)
-
-
-def apply_due_events():
-    for event in sorted(STATE["events"], key=lambda item: (item["tick"], item["seq"])):
-        seq = int(event.get("seq", 0))
-        if seq <= STATE["appliedEventSeq"] or int(event.get("tick", 0)) > STATE["authoritativeTick"]:
-            continue
-        event_type = event.get("type", "input")
-        if event_type == "start":
-            start_simulation()
-        elif event_type == "pause":
-            STATE["running"] = False
-        elif event_type == "input":
-            STATE["apiDirection"] = parse_direction(event.get("direction"))
-            STATE["appliedInputSeq"] = max(STATE["appliedInputSeq"], seq)
-        STATE["appliedEventSeq"] = max(STATE["appliedEventSeq"], seq)
-
-
-def update_paddles(dt):
-    ball = STATE["ball"]
-    paddles = STATE["paddles"]
-    target = float(ball["y"]) - SETTINGS["paddleHeight"] / 2
-    left_start = float(paddles["leftY"])
-    left_delta = clamp(target - left_start, -320 * dt, 320 * dt)
-    left_y = clamp(left_start + left_delta, 0, SETTINGS["height"] - SETTINGS["paddleHeight"])
-    paddles["leftY"] = left_y
-    paddles["leftVy"] = (left_y - left_start) / dt if dt > 0 else 0
-
-    right_start = float(paddles["rightY"])
-    right_y = clamp(
-        right_start + int(STATE["apiDirection"]) * 360 * dt,
-        0,
-        SETTINGS["height"] - SETTINGS["paddleHeight"],
-    )
-    paddles["rightY"] = right_y
-    paddles["rightVy"] = (right_y - right_start) / dt if dt > 0 else 0
-
-
-def paddle_hit(x, y):
-    ball = STATE["ball"]
-    return (
-        float(ball["x"]) < x + SETTINGS["paddleWidth"]
-        and float(ball["x"]) + SETTINGS["ballSize"] > x
-        and float(ball["y"]) < y + SETTINGS["paddleHeight"]
-        and float(ball["y"]) + SETTINGS["ballSize"] > y
-    )
-
-
-def bounce_from_paddle(paddle_y, paddle_vy, direction):
-    import math
-
-    ball = STATE["ball"]
-    ball_center = float(ball["y"]) + SETTINGS["ballSize"] / 2
-    paddle_center = paddle_y + SETTINGS["paddleHeight"] / 2
-    normalized = clamp((ball_center - paddle_center) / (SETTINGS["paddleHeight"] / 2), -1, 1)
-    speed = min(float(ball.get("speed", 275)) + 8, 520)
-    incoming_vy = float(ball["vy"])
-    max_vertical = speed * 0.88
-    ball["speed"] = speed
-    ball["vy"] = clamp(incoming_vy * 0.85 + paddle_vy * 0.45 + normalized * speed * 0.18, -max_vertical, max_vertical)
-    ball["vx"] = direction * math.sqrt(max(0, speed**2 - float(ball["vy"]) ** 2))
-
-
-def update_ball(dt):
-    ball = STATE["ball"]
-    ball["x"] = float(ball["x"]) + float(ball["vx"]) * dt
-    ball["y"] = float(ball["y"]) + float(ball["vy"]) * dt
-
-    if ball["y"] <= 0:
-        ball["y"] = 0
-        ball["vy"] = abs(float(ball["vy"]))
-    elif ball["y"] + SETTINGS["ballSize"] >= SETTINGS["height"]:
-        ball["y"] = SETTINGS["height"] - SETTINGS["ballSize"]
-        ball["vy"] = -abs(float(ball["vy"]))
-
-    left_x = 24
-    right_x = SETTINGS["width"] - 34
-    if float(ball["vx"]) < 0 and paddle_hit(left_x, float(STATE["paddles"]["leftY"])):
-        ball["x"] = left_x + SETTINGS["paddleWidth"]
-        bounce_from_paddle(float(STATE["paddles"]["leftY"]), float(STATE["paddles"].get("leftVy", 0)), 1)
-    elif float(ball["vx"]) > 0 and paddle_hit(right_x, float(STATE["paddles"]["rightY"])):
-        ball["x"] = right_x - SETTINGS["ballSize"]
-        bounce_from_paddle(float(STATE["paddles"]["rightY"]), float(STATE["paddles"].get("rightVy", 0)), -1)
-
-    if ball["x"] + SETTINGS["ballSize"] < 0:
-        STATE["score"]["right"] += 1
-        ball["speed"] = 275
-        reset_ball(1)
-    elif ball["x"] > SETTINGS["width"]:
-        STATE["score"]["left"] += 1
-        ball["speed"] = 275
-        reset_ball(-1)
-
-
-def rasterize_state():
-    width = SETTINGS["width"]
-    height = SETTINGS["height"]
-    mask = bytearray(width * height)
-
-    def mark_rect(x, y, rect_width, rect_height):
-        left = int(clamp(int(x), 0, width))
-        right = int(clamp(int(x + rect_width + 0.999), 0, width))
-        top = int(clamp(int(y), 0, height))
-        bottom = int(clamp(int(y + rect_height + 0.999), 0, height))
-        if left >= right or top >= bottom:
-            return
-        for row in range(top, bottom):
-            start = row * width + left
-            mask[start : row * width + right] = b"\x01" * (right - left)
-
-    for y in range(0, SETTINGS["height"], 24):
-        mark_rect(SETTINGS["width"] / 2 - 1, y, 2, 12)
-    mark_rect(24, float(STATE["paddles"]["leftY"]), SETTINGS["paddleWidth"], SETTINGS["paddleHeight"])
-    mark_rect(SETTINGS["width"] - 34, float(STATE["paddles"]["rightY"]), SETTINGS["paddleWidth"], SETTINGS["paddleHeight"])
-    mark_rect(float(STATE["ball"]["x"]), float(STATE["ball"]["y"]), SETTINGS["ballSize"], SETTINGS["ballSize"])
-    return mask
-
-
-def capture_event_frame():
-    global EVENT_CAMERA_PREVIOUS, EVENT_CAMERA_TOKEN
-
-    mask = rasterize_state()
-    pixels = []
-    changed_baseline = EVENT_CAMERA_PREVIOUS is None or EVENT_CAMERA_TOKEN != STATE["resetToken"]
-    if not changed_baseline:
-        pixels = [index for index, value in enumerate(mask) if value != EVENT_CAMERA_PREVIOUS[index]]
-    EVENT_CAMERA_PREVIOUS = mask
-    EVENT_CAMERA_TOKEN = STATE["resetToken"]
+def normalize_world_observation(body):
+    settings = {**SETTINGS, **(body.get("settings") if isinstance(body.get("settings"), dict) else {})}
+    ball = body.get("ball") if isinstance(body.get("ball"), dict) else {}
+    paddles = body.get("paddles") if isinstance(body.get("paddles"), dict) else {}
+    score = body.get("score") if isinstance(body.get("score"), dict) else {}
+    tick = int(body.get("tick", body.get("authoritativeTick", 0)) or 0)
+    frame_seq = int(body.get("frameSeq", tick) or 0)
+    rendered_at = float(body.get("renderedAt", time.time() * 1000) or 0)
+    event_camera = normalize_event_camera(body.get("eventCamera"), tick, frame_seq, rendered_at)
     return {
-        "width": SETTINGS["width"],
-        "height": SETTINGS["height"],
-        "tick": STATE["authoritativeTick"],
-        "frameSeq": STATE["frameSeq"],
+        "sessionId": STATE["sessionId"],
         "resetToken": STATE["resetToken"],
-        "renderedAt": STATE["renderedAt"],
-        "source": "backend",
-        "pixels": pixels,
-        "count": len(pixels),
+        "seed": STATE["seed"],
+        "tick": tick,
+        "authoritativeTick": tick,
+        "frameSeq": frame_seq,
+        "renderedAt": rendered_at,
+        "running": bool(body.get("running", STATE["running"])),
+        "settings": copy.deepcopy(settings),
+        "score": {
+            "left": int(score.get("left", 0) or 0),
+            "right": int(score.get("right", 0) or 0),
+        },
+        "ball": {
+            "x": float(ball.get("x", settings["width"] / 2) or 0),
+            "y": float(ball.get("y", settings["height"] / 2) or 0),
+            "vx": float(ball.get("vx", 0) or 0),
+            "vy": float(ball.get("vy", 0) or 0),
+        },
+        "paddles": {
+            "leftY": float(paddles.get("leftY", (settings["height"] - settings["paddleHeight"]) / 2) or 0),
+            "rightY": float(paddles.get("rightY", (settings["height"] - settings["paddleHeight"]) / 2) or 0),
+        },
+        "appliedInputSeq": int(body.get("appliedInputSeq", 0) or 0),
+        "appliedEventSeq": int(body.get("appliedEventSeq", 0) or 0),
+        "eventCamera": event_camera,
+        "source": body.get("source") if isinstance(body.get("source"), str) else "game",
+        "updatedAt": time.time(),
     }
 
 
-def backend_step():
-    apply_due_events()
-    physics_dt = SETTINGS["fixedDt"] * float(SETTINGS.get("simulationSpeed", 1.0))
-    update_paddles(physics_dt)
-    if STATE["running"]:
-        update_ball(physics_dt)
-    STATE["authoritativeTick"] += 1
-    STATE["frameSeq"] += 1
-    STATE["renderedAt"] = time.time() * 1000
-    STATE["eventCamera"] = capture_event_frame()
-    apply_snn_to_state()
-    STATE["source"] = "backend-sim"
-    STATE["updatedAt"] = time.time()
-    compact_events()
-
-
-def backend_loop():
-    next_frame = time.perf_counter()
-    while True:
-        with STATE_LOCK:
-            backend_step()
-        next_frame += SETTINGS["fixedDt"]
-        delay = next_frame - time.perf_counter()
-        if delay < -0.25:
-            next_frame = time.perf_counter()
-            delay = SETTINGS["fixedDt"]
-        time.sleep(max(0.001, delay))
-
-
-def ensure_backend_loop():
-    global SIM_THREAD
-
-    with SIM_THREAD_LOCK:
-        if SIM_THREAD and SIM_THREAD.is_alive():
-            return
-        SIM_THREAD = threading.Thread(target=backend_loop, daemon=True, name="pong-backend-sim")
-        SIM_THREAD.start()
-
-
-def reset_game_state(reset_score=True):
-    global SIM_RNG, EVENT_CAMERA_PREVIOUS, EVENT_CAMERA_TOKEN
-
+def reset_game_state_locked(reset_score=True):
     STATE["sessionId"] = f"local-{int(time.time() * 1000):x}"
     STATE["resetToken"] += 1
     STATE["seed"] = int(time.time() * 1000) & 0xFFFFFFFF
-    SIM_RNG = random.Random(STATE["seed"])
-    EVENT_CAMERA_PREVIOUS = None
-    EVENT_CAMERA_TOKEN = None
     STATE["authoritativeTick"] = 0
     STATE["eventSeq"] = 0
     STATE["events"] = []
@@ -451,24 +323,70 @@ def reset_game_state(reset_score=True):
     STATE["inputEvents"] = []
     STATE["apiDirection"] = 0
     STATE["running"] = False
-    if reset_score:
-        STATE["score"] = {"left": 0, "right": 0}
-    STATE["ball"] = {"x": SETTINGS["width"] / 2, "y": SETTINGS["height"] / 2, "vx": 0, "vy": 0, "speed": 275}
-    STATE["paddles"] = {
-        "leftY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
-        "rightY": (SETTINGS["height"] - SETTINGS["paddleHeight"]) / 2,
-    }
-    STATE["appliedInputSeq"] = 0
-    STATE["appliedEventSeq"] = 0
-    STATE["frameSeq"] = 0
-    STATE["renderedAt"] = 0
-    STATE["eventCamera"] = None
-    STATE["source"] = "backend"
+    STATE["latestAction"] = None
+    STATE["worldFrameSeq"] = 0
+    STATE["worldObservedAt"] = 0
+    latest = initial_world_state()
+    if not reset_score and STATE.get("latestWorld"):
+        latest["score"] = copy.deepcopy(STATE["latestWorld"].get("score", latest["score"]))
+    STATE["latestWorld"] = latest
     STATE["updatedAt"] = time.time()
+    SNN_RUNTIME["lastFrameSeq"] = -1
+    SNN_RUNTIME["lastStepAt"] = 0.0
+    SNN_RUNTIME["samples"] = 0
+    SNN_RUNTIME["skippedFrames"] = 0
+
+
+def snn_loop():
+    target_dt = 1.0 / max(1, int(SETTINGS.get("snnStepHz", 60)))
+    while True:
+        started_at = time.perf_counter()
+        with STATE_LOCK:
+            world = copy.deepcopy(STATE["latestWorld"])
+            frame_seq = int((world or {}).get("frameSeq", -1))
+            event_camera = copy.deepcopy((world or {}).get("eventCamera"))
+            tick = int((world or {}).get("tick", STATE["authoritativeTick"]))
+            should_sample = (
+                event_camera is not None
+                and frame_seq != SNN_RUNTIME["lastFrameSeq"]
+            )
+        if should_sample:
+            with SNN_LOCK:
+                active = SNN.training and not SNN.paused
+                direction = SNN.step(event_camera, tick, world) if active else None
+                should_emit = direction is not None and SNN.should_emit_command(direction, tick)
+            with STATE_LOCK:
+                if frame_seq > SNN_RUNTIME["lastFrameSeq"] + 1 and SNN_RUNTIME["lastFrameSeq"] >= 0:
+                    SNN_RUNTIME["skippedFrames"] += frame_seq - SNN_RUNTIME["lastFrameSeq"] - 1
+                SNN_RUNTIME["lastFrameSeq"] = frame_seq
+                SNN_RUNTIME["lastStepAt"] = time.time()
+                SNN_RUNTIME["samples"] += 1
+                if should_emit:
+                    add_session_event_locked(
+                        {
+                            "type": "input",
+                            "tick": tick + 1,
+                            "direction": direction,
+                            "source": "snn",
+                        },
+                        "input",
+                    )
+        elapsed = time.perf_counter() - started_at
+        time.sleep(max(0.001, target_dt - elapsed))
+
+
+def ensure_snn_loop():
+    global SNN_THREAD
+
+    with SNN_THREAD_LOCK:
+        if SNN_THREAD and SNN_THREAD.is_alive():
+            return
+        SNN_THREAD = threading.Thread(target=snn_loop, daemon=True, name="pong-snn-worker")
+        SNN_THREAD.start()
 
 
 class PongHandler(BaseHTTPRequestHandler):
-    server_version = "PongSNN/0.2"
+    server_version = "PongSNN/0.3"
 
     def log_message(self, fmt, *args):
         print("%s - - [%s] %s" % (self.address_string(), self.log_date_time_string(), fmt % args))
@@ -481,7 +399,7 @@ class PongHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        ensure_backend_loop()
+        ensure_snn_loop()
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/" or path == "/index.html":
@@ -496,43 +414,33 @@ class PongHandler(BaseHTTPRequestHandler):
             self.send_json(payload)
             return
         if path == "/api/inputs":
-            query = parse_qs(parsed.query)
-            has_since_seq = "sinceSeq" in query
-            since_seq = int(query.get("sinceSeq", ["0"])[0])
-            since_tick = int(query.get("sinceTick", ["-1"])[0])
-            with STATE_LOCK:
-                if has_since_seq:
-                    events = [event for event in STATE["inputEvents"] if event["seq"] > since_seq]
-                else:
-                    events = [event for event in STATE["inputEvents"] if event["tick"] > since_tick]
-                payload = {**session_payload(), "events": copy.deepcopy(events)}
-            self.send_json(payload)
+            self.send_events(parsed, only_inputs=True)
             return
         if path == "/api/events":
-            query = parse_qs(parsed.query)
-            has_since_seq = "sinceSeq" in query
-            since_seq = int(query.get("sinceSeq", ["0"])[0])
-            since_tick = int(query.get("sinceTick", ["-1"])[0])
+            self.send_events(parsed, only_inputs=False)
+            return
+        if path == "/api/actions/latest":
             with STATE_LOCK:
-                if has_since_seq:
-                    events = [event for event in STATE["events"] if event["seq"] > since_seq]
-                else:
-                    events = [event for event in STATE["events"] if event["tick"] > since_tick]
-                payload = {**session_payload(), "events": copy.deepcopy(events)}
+                payload = {**session_payload(), "action": copy.deepcopy(STATE["latestAction"])}
             self.send_json(payload)
             return
-        if path == "/api/state":
+        if path == "/api/state" or path == "/api/world/state":
             with STATE_LOCK:
-                payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS}
+                payload = copy.deepcopy(STATE["latestWorld"])
+                payload["settings"] = copy.deepcopy(SETTINGS)
+                payload["latestAction"] = copy.deepcopy(STATE["latestAction"])
+                payload["streams"] = session_payload()["streams"]
             self.send_json(payload)
             return
         if path == "/api/snn/status":
-            with STATE_LOCK:
+            with SNN_LOCK:
                 payload = SNN.status()
+            with STATE_LOCK:
+                payload["runtime"] = copy.deepcopy(SNN_RUNTIME)
             self.send_json(payload)
             return
         if path == "/api/snn/saves":
-            with STATE_LOCK:
+            with SNN_LOCK:
                 payload = {"saves": SNN.list_saves()}
             self.send_json(payload)
             return
@@ -544,7 +452,7 @@ class PongHandler(BaseHTTPRequestHandler):
         self.send_error(404, "Not found")
 
     def do_POST(self):
-        ensure_backend_loop()
+        ensure_snn_loop()
         try:
             body = read_json(self)
             path = urlparse(self.path).path
@@ -563,8 +471,8 @@ class PongHandler(BaseHTTPRequestHandler):
             if path == "/api/event":
                 self.add_event(body)
                 return
-            if path == "/api/state":
-                self.update_game_state(body)
+            if path == "/api/state" or path == "/api/world/state":
+                self.update_world_state(body)
                 return
             if path == "/api/reset":
                 self.reset_game(body)
@@ -588,6 +496,20 @@ class PongHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
 
+    def send_events(self, parsed, only_inputs):
+        query = parse_qs(parsed.query)
+        has_since_seq = "sinceSeq" in query
+        since_seq = int(query.get("sinceSeq", ["0"])[0])
+        since_tick = int(query.get("sinceTick", ["-1"])[0])
+        with STATE_LOCK:
+            source = STATE["inputEvents"] if only_inputs else STATE["events"]
+            if has_since_seq:
+                events = [event for event in source if event["seq"] > since_seq]
+            else:
+                events = [event for event in source if event["tick"] > since_tick]
+            payload = {**session_payload(), "events": copy.deepcopy(events)}
+        self.send_json(payload)
+
     def set_control_mode(self, body):
         mode = body.get("mode")
         if mode not in ("human", "api"):
@@ -610,95 +532,76 @@ class PongHandler(BaseHTTPRequestHandler):
 
     def add_event(self, body, default_type="input"):
         with STATE_LOCK:
-            event = add_session_event(body, default_type)
+            event = add_session_event_locked(body, default_type)
             payload = {**session_payload(), "event": copy.deepcopy(event)}
         self.send_json(payload)
 
-    def update_game_state(self, body):
+    def update_world_state(self, body):
+        observation = normalize_world_observation(body)
         with STATE_LOCK:
-            if "tick" in body:
-                STATE["authoritativeTick"] = max(STATE["authoritativeTick"], int(body["tick"]))
-            if "score" in body:
-                score = body["score"]
-                STATE["score"] = {
-                    "left": int(score.get("left", STATE["score"]["left"])),
-                    "right": int(score.get("right", STATE["score"]["right"])),
-                }
-            if "running" in body:
-                STATE["running"] = bool(body["running"])
-            if "ball" in body:
-                ball = body["ball"]
-                STATE["ball"] = {
-                    "x": float(ball.get("x", STATE["ball"]["x"])),
-                    "y": float(ball.get("y", STATE["ball"]["y"])),
-                    "vx": float(ball.get("vx", STATE["ball"]["vx"])),
-                    "vy": float(ball.get("vy", STATE["ball"]["vy"])),
-                }
-            if "paddles" in body:
-                paddles = body["paddles"]
-                STATE["paddles"] = {
-                    "leftY": float(paddles.get("leftY", STATE["paddles"]["leftY"])),
-                    "rightY": float(paddles.get("rightY", STATE["paddles"]["rightY"])),
-                }
-            if "appliedInputSeq" in body:
-                STATE["appliedInputSeq"] = max(STATE["appliedInputSeq"], int(body["appliedInputSeq"]))
-            if "appliedEventSeq" in body:
-                STATE["appliedEventSeq"] = max(STATE["appliedEventSeq"], int(body["appliedEventSeq"]))
-            if "frameSeq" in body:
-                STATE["frameSeq"] = max(STATE["frameSeq"], int(body["frameSeq"]))
-            if "renderedAt" in body:
-                STATE["renderedAt"] = float(body["renderedAt"])
-            if "eventCamera" in body:
-                STATE["eventCamera"] = normalize_event_camera(body["eventCamera"])
-            if isinstance(body.get("source"), str):
-                STATE["source"] = body["source"]
-            snn_event = apply_snn_to_state()
+            if observation["resetToken"] != STATE["resetToken"]:
+                observation["resetToken"] = STATE["resetToken"]
+            STATE["latestWorld"] = observation
+            STATE["authoritativeTick"] = max(STATE["authoritativeTick"], observation["tick"])
+            STATE["worldFrameSeq"] = max(STATE["worldFrameSeq"], observation["frameSeq"])
+            STATE["worldObservedAt"] = time.time()
+            STATE["running"] = observation["running"]
             STATE["updatedAt"] = time.time()
-            compact_events()
+            compact_events_locked()
             payload = {
-                **copy.deepcopy(STATE),
+                "accepted": True,
+                "sessionId": STATE["sessionId"],
+                "resetToken": STATE["resetToken"],
                 "tick": STATE["authoritativeTick"],
-                "settings": SETTINGS,
-                "snnEvent": copy.deepcopy(snn_event),
+                "latestAction": copy.deepcopy(STATE["latestAction"]),
             }
         self.send_json(payload)
 
     def reset_game(self, body):
         with STATE_LOCK:
-            reset_game_state(body.get("resetScore", True) is not False)
-            payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS}
+            reset_game_state_locked(body.get("resetScore", True) is not False)
+            payload = copy.deepcopy(STATE["latestWorld"])
+            payload["settings"] = copy.deepcopy(SETTINGS)
         self.send_json(payload)
 
     def start_snn(self, body):
+        with SNN_LOCK:
+            SNN.start()
+            status = SNN.status()
         with STATE_LOCK:
             STATE["mode"] = "api"
-            SNN.start()
-            start_event = add_session_event(
+            start_event = add_session_event_locked(
                 {"type": "start", "tick": parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)},
                 "start",
             )
-            payload = {**session_payload(), "event": copy.deepcopy(start_event), "snn": SNN.status()}
+            payload = {**session_payload(), "event": copy.deepcopy(start_event), "snn": status}
         self.send_json(payload)
 
     def pause_snn(self, body):
-        with STATE_LOCK:
+        with SNN_LOCK:
             SNN.pause()
-            pause_event = add_session_event(
+            status = SNN.status()
+        with STATE_LOCK:
+            pause_event = add_session_event_locked(
                 {"type": "pause", "tick": parse_tick(body.get("tick"), STATE["authoritativeTick"] + 1)},
                 "pause",
             )
-            payload = {**session_payload(), "event": copy.deepcopy(pause_event), "snn": SNN.status()}
+            payload = {**session_payload(), "event": copy.deepcopy(pause_event), "snn": status}
         self.send_json(payload)
 
     def reset_snn(self, body):
-        with STATE_LOCK:
+        with SNN_LOCK:
             SNN.reset(reset_weights=body.get("resetWeights", True) is not False)
-            reset_game_state(body.get("resetScore", True) is not False)
-            payload = {**copy.deepcopy(STATE), "tick": STATE["authoritativeTick"], "settings": SETTINGS, "snn": SNN.status()}
+            status = SNN.status()
+        with STATE_LOCK:
+            reset_game_state_locked(body.get("resetScore", True) is not False)
+            payload = copy.deepcopy(STATE["latestWorld"])
+            payload["settings"] = copy.deepcopy(SETTINGS)
+            payload["snn"] = status
         self.send_json(payload)
 
     def save_snn(self, body):
-        with STATE_LOCK:
+        with SNN_LOCK:
             name = SNN.save(body.get("name"))
             payload = {"saved": name, "saves": SNN.list_saves(), "snn": SNN.status()}
         self.send_json(payload)
@@ -707,7 +610,7 @@ class PongHandler(BaseHTTPRequestHandler):
         name = body.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("name is required")
-        with STATE_LOCK:
+        with SNN_LOCK:
             loaded = SNN.load(name)
             payload = {"loaded": loaded, "saves": SNN.list_saves(), "snn": SNN.status()}
         self.send_json(payload)
@@ -737,12 +640,12 @@ class PongHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run the local Pong SNN game server.")
+    parser = argparse.ArgumentParser(description="Run the local Pong SNN stream server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    ensure_backend_loop()
+    ensure_snn_loop()
     server = ThreadingHTTPServer((args.host, args.port), PongHandler)
     print(f"Pong SNN server listening at http://{args.host}:{args.port}")
     try:
