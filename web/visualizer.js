@@ -54,13 +54,18 @@ const viewer = {
   snnPollMs: 120,
   streams: null,
   latestAction: null,
+  worldRunner: null,
 };
 
 function resize() {
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.floor(canvas.clientWidth * dpr);
-  canvas.height = Math.floor(canvas.clientHeight * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (viewer.worldRunner) {
+    viewer.worldRunner.resize(canvas.clientWidth, canvas.clientHeight);
+  } else {
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
   if (networkCanvas && networkCtx) {
     networkCanvas.width = Math.floor(networkCanvas.clientWidth * dpr);
     networkCanvas.height = Math.floor(networkCanvas.clientHeight * dpr);
@@ -223,26 +228,27 @@ function acceptState(rawState, source) {
 
 function render() {
   if (!viewer.latestState) {
-    PongCore.drawState(ctx, canvas.clientWidth, canvas.clientHeight, {
-      settings: PongCore.DEFAULT_SETTINGS,
-      score: { left: 0, right: 0 },
-      ball: {
-        x: PongCore.DEFAULT_SETTINGS.width / 2,
-        y: PongCore.DEFAULT_SETTINGS.height / 2,
-        vx: 0,
-        vy: 0,
-      },
-      paddles: {
-        leftY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
-        rightY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
-      },
-    });
+    if (!viewer.worldRunner) {
+      PongCore.drawState(ctx, canvas.clientWidth, canvas.clientHeight, {
+        settings: PongCore.DEFAULT_SETTINGS,
+        score: { left: 0, right: 0 },
+        ball: {
+          x: PongCore.DEFAULT_SETTINGS.width / 2,
+          y: PongCore.DEFAULT_SETTINGS.height / 2,
+          vx: 0,
+          vy: 0,
+        },
+        paddles: {
+          leftY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
+          rightY: (PongCore.DEFAULT_SETTINGS.height - PongCore.DEFAULT_SETTINGS.paddleHeight) / 2,
+        },
+      });
+    }
     scoreEl.textContent = "0:0";
     renderSnn();
     return;
   }
 
-  PongCore.drawState(ctx, canvas.clientWidth, canvas.clientHeight, viewer.latestState);
   drawEventTrail(ctx, canvas.clientWidth, canvas.clientHeight);
   scoreEl.textContent = `${viewer.latestState.score.left}:${viewer.latestState.score.right}`;
   viewer.lastRenderedFrameSeq = viewer.latestState.frameSeq;
@@ -497,6 +503,9 @@ function maybePollBackendState(now = performance.now()) {
 }
 
 async function resetGame() {
+  if (viewer.worldRunner) {
+    await viewer.worldRunner.pause();
+  }
   const response = await fetch("/api/snn/reset", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -505,6 +514,10 @@ async function resetGame() {
   });
   if (response.ok) {
     acceptState(await response.json(), "backend");
+    if (viewer.worldRunner) {
+      const session = await fetch("/api/session", { cache: "no-store" }).then((item) => item.json());
+      viewer.worldRunner.resetFromSession(session);
+    }
     await pollSnnStatusOnce();
     render();
   }
@@ -555,13 +568,21 @@ function nextObservedTick() {
 }
 
 async function startSnn() {
+  if (viewer.worldRunner) {
+    await viewer.worldRunner.start();
+  }
   const payload = await postSnn("/api/snn/start", { tick: nextObservedTick() });
   if (payload?.snn) viewer.snnStatus = payload.snn;
+  renderSnn();
 }
 
 async function pauseSnn() {
+  if (viewer.worldRunner) {
+    await viewer.worldRunner.pause();
+  }
   const payload = await postSnn("/api/snn/pause", { tick: nextObservedTick() });
   if (payload?.snn) viewer.snnStatus = payload.snn;
+  renderSnn();
 }
 
 async function saveSnn() {
@@ -654,6 +675,14 @@ if (viewer.stateChannel) {
   });
 }
 window.addEventListener("resize", resize);
+
+if (window.PongWorldRunner && window.EventCamera) {
+  viewer.worldRunner = PongWorldRunner.create({
+    canvas,
+    onFrame: (state) => acceptState(state, "world-runner"),
+  });
+  viewer.worldRunner.begin();
+}
 
 window.__pongViewer = viewer;
 resize();

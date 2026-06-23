@@ -6,6 +6,7 @@ const vm = require("vm");
 const root = path.resolve(__dirname, "..");
 const coreSource = fs.readFileSync(path.join(root, "web", "pong-core.js"), "utf8");
 const eventCameraSource = fs.readFileSync(path.join(root, "web", "event-camera.js"), "utf8");
+const worldRunnerSource = fs.readFileSync(path.join(root, "web", "world-runner.js"), "utf8");
 const gameSource = fs.readFileSync(path.join(root, "web", "game.js"), "utf8");
 const visualizerSource = fs.readFileSync(path.join(root, "web", "visualizer.js"), "utf8");
 
@@ -179,11 +180,34 @@ function fakeContext() {
         body = session;
       } else if (href.includes("/api/events")) {
         body = { ...session, events: [] };
+      } else if (href.includes("/api/start")) {
+        session.running = true;
+        body = { ...session, event: { seq: 1, type: "start", tick: 0 } };
+      } else if (href.includes("/api/event")) {
+        session.running = false;
+        body = { ...session, event: { seq: 2, type: "pause", tick: 0 } };
       } else if (href.includes("/api/world/state")) {
         postedObservations.push(JSON.parse(options.body));
         body = { accepted: true };
       } else if (href.includes("/api/state")) {
         body = postedObservations.at(-1) || { ...session, source: "waiting-for-world" };
+      } else if (href.includes("/api/snn/start")) {
+        body = { ...session, snn: { training: true, paused: false, activity: { outputBars: [0, 0, 1] } } };
+      } else if (href.includes("/api/snn/pause")) {
+        body = { ...session, snn: { training: true, paused: true, activity: { outputBars: [0, 0, 1] } } };
+      } else if (href.includes("/api/snn/reset")) {
+        session.running = false;
+        session.resetToken += 1;
+        body = {
+          ...session,
+          source: "waiting-for-world",
+          tick: 0,
+          frameSeq: 0,
+          score: { left: 0, right: 0 },
+          ball: { x: 400, y: 225, vx: 0, vy: 0 },
+          paddles: { leftY: 185, rightY: 185 },
+          snn: { training: false, paused: true, activity: { outputBars: [0, 0, 1] } },
+        };
       } else if (href.includes("/api/snn/status")) {
         body = {
           training: true,
@@ -240,8 +264,10 @@ function fakeContext() {
   vm.createContext(context);
   vm.runInContext(coreSource, context, { filename: "pong-core.js" });
   vm.runInContext(eventCameraSource, context, { filename: "event-camera.js" });
+  vm.runInContext(worldRunnerSource, context, { filename: "world-runner.js" });
   context.PongCore = context.window.PongCore;
   context.EventCamera = context.window.EventCamera;
+  context.PongWorldRunner = context.window.PongWorldRunner;
   return context;
 }
 
@@ -252,7 +278,7 @@ const game = fakeContext();
 vm.runInContext(gameSource, game, { filename: "game.js" });
 vm.runInContext(
   `
-  resetFromSession({
+  window.__pongClient.resetFromSession({
     sessionId: "stream-smoke",
     resetToken: 3,
     seed: 123,
@@ -269,10 +295,10 @@ vm.runInContext(
       simulationSpeed: 1
     }
   });
-  queueEvents([{ seq: 1, type: "start", tick: 0 }]);
-  frame(0);
-  frame(17);
-  frame(34);
+  window.__pongClient.queueEvents([{ seq: 1, type: "start", tick: 0 }]);
+  window.__pongClient.frame(0);
+  window.__pongClient.frame(17);
+  window.__pongClient.frame(34);
   `,
   game
 );
@@ -305,16 +331,67 @@ assert(
   "visualizer should draw game event-camera pixels as an opaque red overlay"
 );
 
-console.log(
-  JSON.stringify(
-    {
-      ok: true,
-      frameSeq: latestVisualizerFrame.frameSeq,
-      tick: latestVisualizerFrame.tick,
-      source: latestVisualizerFrame.source,
-      resetToken: latestVisualizerFrame.resetToken,
-    },
-    null,
-    2
-  )
+const controlPromise = vm.runInContext(
+  `
+  window.__controlPromise = (async () => {
+    await startSnn();
+    window.__pongViewer.worldRunner.frame(51);
+    window.__pongViewer.worldRunner.frame(68);
+    window.__startButtonState = {
+      running: window.__pongViewer.worldRunner.sim.running,
+      tick: window.__pongViewer.worldRunner.sim.tick,
+      frameSeq: window.__pongViewerState?.frameSeq,
+      eventCount: window.__pongViewerState?.eventCamera?.count,
+      trainState: document.getElementById("trainState").textContent
+    };
+    await pauseSnn();
+    window.__pongViewer.worldRunner.frame(85);
+    window.__pauseButtonState = {
+      running: window.__pongViewer.worldRunner.sim.running,
+      tick: window.__pongViewer.worldRunner.sim.tick
+    };
+    await resetGame();
+    window.__resetButtonState = {
+      running: window.__pongViewer.worldRunner.sim.running,
+      tick: window.__pongViewer.worldRunner.sim.tick,
+      resetToken: window.__pongViewer.worldRunner.resetToken
+    };
+  })()
+  `,
+  visualizer
 );
+const resolvedControlPromise = controlPromise || visualizer.window.__controlPromise;
+
+resolvedControlPromise
+  .then(() => {
+    assert.strictEqual(visualizer.window.__startButtonState.running, true, "visualizer start should start the world runner");
+    assert(visualizer.window.__startButtonState.tick > 0, "visualizer start should advance world ticks");
+    assert(
+      visualizer.window.__startButtonState.frameSeq >= 0,
+      "visualizer start should produce a world/event-camera frame"
+    );
+    assert.strictEqual(visualizer.window.__pauseButtonState.running, false, "visualizer pause should pause the world runner");
+    assert.strictEqual(visualizer.window.__resetButtonState.running, false, "visualizer reset should leave the world paused");
+    assert.strictEqual(visualizer.window.__resetButtonState.tick, 0, "visualizer reset should reset world tick");
+
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          frameSeq: latestVisualizerFrame.frameSeq,
+          tick: latestVisualizerFrame.tick,
+          source: latestVisualizerFrame.source,
+          resetToken: latestVisualizerFrame.resetToken,
+          startButton: visualizer.window.__startButtonState,
+          pauseButton: visualizer.window.__pauseButtonState,
+          resetButton: visualizer.window.__resetButtonState,
+        },
+        null,
+        2
+      )
+    );
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
