@@ -108,6 +108,10 @@ def main():
         assert status["activity"]["spikes"]["hidden1"] > 0
         assert status["activity"]["winner"] in {"move up", "move down", "stay put"}
         assert isinstance(status["reward"]["value"], (int, float))
+        assert "outputConfidence" in status["reward"]["components"]
+        assert "chosenMovementPenalty" in status["reward"]["components"]
+        assert "winnerMargin" in status["reward"]["metrics"]
+        assert "rewardComponents" in status["architecture"]["stdp"]
         assert "inputH1" in status["eligibility"]
         assert "h3Output" in status["eligibility"]
         assert status["learning"]["step"] > 0

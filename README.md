@@ -94,6 +94,15 @@ decreases it slightly, and traces decay each SNN sample. Pong reward then gates
 weights with `weight += learning_rate * reward * eligibility`, clamped to the
 network's existing weight range.
 
+Reward is assembled from named, tunable components in `RewardFunction`. The
+large sparse rewards are still right-paddle hits and misses. The smaller shaping
+terms include the old distance-delta alignment signal, an aligned-movement cost,
+output confidence, competitor-output suppression, up/down movement cost,
+direction-change cost, a small same-direction smoothing credit, and a small
+confident-stay credit. The newer output-behavior terms only use the SNN readout
+and recent chosen direction; they do not add more Pong-state features to the
+event-camera input path.
+
 SNN controls:
 
 ```powershell

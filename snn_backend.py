@@ -11,6 +11,21 @@ OUTPUTS = (
     {"name": "stay put", "direction": 0},
 )
 
+REWARD_PARAMS = {
+    "total": {"min": -1.25, "max": 1.15},
+    "alignment": {"scale": 0.06, "movementThreshold": 0.01},
+    "alignedMovementPenalty": {"value": -0.012, "distanceScale": 0.16, "ballScale": 2.0},
+    "hit": {"value": 1.0},
+    "miss": {"value": -1.0},
+    "outputConfidence": {"targetMargin": 0.28, "scale": 0.055, "min": -0.035, "max": 0.026},
+    "competingOutputPenalty": {"scale": -0.018},
+    "movementOutputPenalty": {"scale": -0.014},
+    "chosenMovementPenalty": {"value": -0.014},
+    "directionChangePenalty": {"value": -0.045},
+    "smoothMotionReward": {"value": 0.007},
+    "quietOutputReward": {"scale": 0.014, "targetMargin": 0.22},
+}
+
 
 def _clamp(value, low=0.0, high=1.0):
     return max(low, min(high, value))
@@ -26,6 +41,127 @@ def _neighborhood(cx, cy, width, height, radius):
         for x in range(max(0, cx - radius), min(width, cx + radius + 1)):
             coords.append(_grid_index(x, y, width))
     return coords
+
+
+class RewardFunction:
+    """Named reward components with central, inspectable tuning parameters."""
+
+    def __init__(self, params=None):
+        self.params = self._merge_params(REWARD_PARAMS, params or {})
+        self.previous_direction = None
+
+    def _merge_params(self, defaults, overrides):
+        merged = {}
+        for key, value in defaults.items():
+            base = dict(value)
+            base.update(overrides.get(key, {}))
+            merged[key] = base
+        for key, value in overrides.items():
+            if key not in merged:
+                merged[key] = dict(value)
+        return merged
+
+    def reset(self):
+        self.previous_direction = None
+
+    def config(self):
+        return {key: dict(value) for key, value in self.params.items()}
+
+    def empty_components(self):
+        return {key: 0.0 for key in self.params if key != "total"}
+
+    def total(self, components):
+        raw = sum(float(value) for value in components.values())
+        params = self.params["total"]
+        return _clamp(raw, params["min"], params["max"])
+
+    def game_components(self, current, previous):
+        components = self.empty_components()
+        if current is None or previous is None:
+            return components, None
+
+        movement = abs(current["rightY"] - previous["rightY"])
+        distance_delta = previous["rightDistance"] - current["rightDistance"]
+
+        alignment = self.params["alignment"]
+        if movement > alignment["movementThreshold"]:
+            scale = max(1.0, current["paddleHeight"])
+            components["alignment"] = _clamp(distance_delta / scale, -1.0, 1.0) * alignment["scale"]
+
+        aligned_penalty = self.params["alignedMovementPenalty"]
+        aligned = current["rightDistance"] <= max(
+            current["ballSize"] * aligned_penalty["ballScale"],
+            current["paddleHeight"] * aligned_penalty["distanceScale"],
+        )
+        if aligned and movement > alignment["movementThreshold"]:
+            components["alignedMovementPenalty"] = aligned_penalty["value"]
+
+        last_event = None
+        right_side = current["ballX"] > current["width"] * 0.65
+        if previous["ballVx"] > 0.0 and current["ballVx"] < 0.0 and right_side:
+            components["hit"] = self.params["hit"]["value"]
+            last_event = "right-paddle-hit"
+        if current["leftScore"] > previous["leftScore"]:
+            components["miss"] = self.params["miss"]["value"]
+            last_event = "right-paddle-miss"
+
+        return components, last_event
+
+    def output_components(self, output_bars, winner_index):
+        components = self.empty_components()
+        bars = self._normalized_output_bars(output_bars)
+        winner_index = self._valid_winner_index(winner_index)
+        direction = int(OUTPUTS[winner_index]["direction"])
+        winner_bar = bars[winner_index]
+        competitors = [value for index, value in enumerate(bars) if index != winner_index]
+        strongest_competitor = max(competitors, default=0.0)
+        competitor_average = sum(competitors) / max(1, len(competitors))
+        margin = winner_bar - strongest_competitor
+
+        confidence = self.params["outputConfidence"]
+        confidence_value = (margin - confidence["targetMargin"]) * confidence["scale"]
+        components["outputConfidence"] = _clamp(confidence_value, confidence["min"], confidence["max"])
+
+        components["competingOutputPenalty"] = self.params["competingOutputPenalty"]["scale"] * competitor_average
+        components["movementOutputPenalty"] = self.params["movementOutputPenalty"]["scale"] * ((bars[0] + bars[1]) / 2.0)
+
+        if direction != 0:
+            components["chosenMovementPenalty"] = self.params["chosenMovementPenalty"]["value"]
+            if self.previous_direction == direction:
+                components["smoothMotionReward"] = self.params["smoothMotionReward"]["value"]
+            elif self.previous_direction in (-1, 1):
+                components["directionChangePenalty"] = self.params["directionChangePenalty"]["value"]
+        else:
+            quiet = self.params["quietOutputReward"]
+            quiet_margin = max(0.0, margin - quiet["targetMargin"])
+            components["quietOutputReward"] = quiet["scale"] * quiet_margin
+
+        self.previous_direction = direction
+        return components, {
+            "winnerBar": round(winner_bar, 5),
+            "strongestCompetitor": round(strongest_competitor, 5),
+            "winnerMargin": round(margin, 5),
+        }
+
+    def _normalized_output_bars(self, output_bars):
+        bars = []
+        for value in list(output_bars or [])[: len(OUTPUTS)]:
+            try:
+                bars.append(_clamp(float(value), 0.0, 1.0))
+            except (TypeError, ValueError):
+                bars.append(0.0)
+        while len(bars) < len(OUTPUTS):
+            bars.append(0.0)
+        return bars
+
+    def _valid_winner_index(self, winner_index):
+        try:
+            winner_index = int(winner_index)
+        except (TypeError, ValueError):
+            return len(OUTPUTS) - 1
+        if winner_index < 0 or winner_index >= len(OUTPUTS):
+            return len(OUTPUTS) - 1
+        return winner_index
 
 
 class PongSNN:
@@ -83,6 +219,7 @@ class PongSNN:
         self.eligibility_plus = 0.16
         self.eligibility_minus = 0.035
         self.last_pong_snapshot = None
+        self.reward_function = RewardFunction()
         self.recent_hits = 0
         self.recent_misses = 0
         self.reward_state = self._empty_reward_state()
@@ -165,11 +302,11 @@ class PongSNN:
     def _empty_reward_state(self):
         return {
             "value": 0.0,
-            "components": {
-                "alignment": 0.0,
-                "hit": 0.0,
-                "miss": 0.0,
-                "movementPenalty": 0.0,
+            "components": self.reward_function.empty_components(),
+            "metrics": {
+                "winnerBar": 0.0,
+                "strongestCompetitor": 0.0,
+                "winnerMargin": 0.0,
             },
             "rightPaddleDistance": None,
             "rightPaddleDelta": 0.0,
@@ -276,6 +413,7 @@ class PongSNN:
                 "eligibilityPlus": self.eligibility_plus,
                 "eligibilityMinus": self.eligibility_minus,
                 "rule": "local pre/post coactivity updates eligibility; reward gates weight changes",
+                "rewardComponents": self.reward_function.config(),
             },
         }
 
@@ -538,57 +676,38 @@ class PongSNN:
             "rightScore": right_score,
         }
 
-    def _reward_from_pong(self, game_state):
+    def _reward_from_pong(self, game_state, output_bars=None, winner_index=None):
         current = self._snapshot_pong(game_state)
+        output_components, output_metrics = self.reward_function.output_components(output_bars, winner_index)
         if current is None:
-            self.reward_state = self._empty_reward_state()
-            return 0.0
+            total = self.reward_function.total(output_components)
+            self.reward_state = {
+                **self._empty_reward_state(),
+                "value": round(total, 5),
+                "components": {key: round(value, 5) for key, value in output_components.items()},
+                "metrics": output_metrics,
+            }
+            return total
 
         previous = self.last_pong_snapshot
         self.last_pong_snapshot = current
-        if previous is None:
-            self.reward_state = {
-                **self._empty_reward_state(),
-                "rightPaddleDistance": round(current["rightDistance"], 3),
-                "recentHits": self.recent_hits,
-                "recentMisses": self.recent_misses,
-            }
-            return 0.0
 
-        movement = abs(current["rightY"] - previous["rightY"])
-        distance_delta = previous["rightDistance"] - current["rightDistance"]
-        alignment_reward = 0.0
-        if movement > 0.01:
-            scale = max(1.0, current["paddleHeight"])
-            alignment_reward = _clamp(distance_delta / scale, -1.0, 1.0) * 0.08
-
-        movement_penalty = 0.0
-        aligned = current["rightDistance"] <= max(current["ballSize"] * 2.0, current["paddleHeight"] * 0.16)
-        if aligned and movement > 0.01:
-            movement_penalty = -0.012
-
-        hit_reward = 0.0
-        miss_reward = 0.0
-        last_event = None
-        right_side = current["ballX"] > current["width"] * 0.65
-        if previous["ballVx"] > 0.0 and current["ballVx"] < 0.0 and right_side:
-            hit_reward = 1.0
+        game_components, last_event = self.reward_function.game_components(current, previous)
+        if game_components["hit"] != 0.0:
             self.recent_hits += 1
-            last_event = "right-paddle-hit"
-        if current["leftScore"] > previous["leftScore"]:
-            miss_reward = -1.0
+        if game_components["miss"] != 0.0:
             self.recent_misses += 1
-            last_event = "right-paddle-miss"
 
-        total = alignment_reward + movement_penalty + hit_reward + miss_reward
+        components = {
+            key: game_components.get(key, 0.0) + output_components.get(key, 0.0)
+            for key in self.reward_function.empty_components()
+        }
+        total = self.reward_function.total(components)
+        distance_delta = 0.0 if previous is None else previous["rightDistance"] - current["rightDistance"]
         self.reward_state = {
             "value": round(total, 5),
-            "components": {
-                "alignment": round(alignment_reward, 5),
-                "hit": round(hit_reward, 5),
-                "miss": round(miss_reward, 5),
-                "movementPenalty": round(movement_penalty, 5),
-            },
+            "components": {key: round(value, 5) for key, value in components.items()},
+            "metrics": output_metrics,
             "rightPaddleDistance": round(current["rightDistance"], 3),
             "rightPaddleDelta": round(distance_delta, 3),
             "lastEvent": last_event,
@@ -621,7 +740,7 @@ class PongSNN:
             "eligibilityDecreased": 0,
         }
         if self.training and not self.paused:
-            reward = self._reward_from_pong(game_state)
+            reward = self._reward_from_pong(game_state, output_bars=output_bars, winner_index=winner_index)
             self._decay_eligibilities()
             local_changes = {"increased": 0, "decreased": 0}
             for update in (
@@ -725,6 +844,9 @@ class PongSNN:
         self.h1_h2_weights = [[float(value) for value in row] for row in payload["h1h2Weights"]]
         self.h2_h3_weights = [[float(value) for value in row] for row in payload["h2h3Weights"]]
         self.h3_out_weights = [[float(value) for value in row] for row in payload["h3outWeights"]]
+        self.last_pong_snapshot = None
+        self.reward_function.reset()
+        self.reward_state = self._empty_reward_state()
         self.activity = self._empty_activity()
 
     def save(self, name=None):
