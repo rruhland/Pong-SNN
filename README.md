@@ -94,14 +94,13 @@ decreases it slightly, and traces decay each SNN sample. Pong reward then gates
 weights with `weight += learning_rate * reward * eligibility`, clamped to the
 network's existing weight range.
 
-Reward is assembled from named, tunable components in `RewardFunction`. The
-large sparse rewards are still right-paddle hits and misses. The smaller shaping
-terms include the old distance-delta alignment signal, an aligned-movement cost,
-output confidence, competitor-output suppression, up/down movement cost,
-direction-change cost, a small same-direction smoothing credit, and a small
-confident-stay credit. The newer output-behavior terms only use the SNN readout
-and recent chosen direction; they do not add more Pong-state features to the
-event-camera input path.
+Reward is assembled from named, tunable components in `RewardFunction`, but the
+signal is intentionally sparse and game-level. Up/down movement receives a small
+cost, doing nothing has no direct cost or reward, opponent score receives a large
+negative reward, right-paddle score receives a larger positive reward, and each
+surviving frame receives a small `log1p(seconds_since_restart)` reward. The
+reward path does not use paddle-ball distance, output confidence, or other
+engineered Pong-state shaping terms.
 
 SNN controls:
 

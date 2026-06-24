@@ -24,7 +24,7 @@ const spikeCountsEl = document.getElementById("spikeCounts");
 const stdpCountsEl = document.getElementById("stdpCounts");
 const rewardReadoutEl = document.getElementById("rewardReadout");
 const eligibilityReadoutEl = document.getElementById("eligibilityReadout");
-const hitMissReadoutEl = document.getElementById("hitMissReadout");
+const scoreRewardReadoutEl = document.getElementById("scoreRewardReadout");
 const learningReadoutEl = document.getElementById("learningReadout");
 const deviceEl = document.getElementById("device");
 const trainStateEl = document.getElementById("trainState");
@@ -300,8 +300,9 @@ function renderSnn() {
   if (eligibilityReadoutEl) {
     eligibilityReadoutEl.textContent = `eligibility ${eligibilityActive} traces / max ${maxEligibility.toFixed(3)}`;
   }
-  if (hitMissReadoutEl) {
-    hitMissReadoutEl.textContent = `hits ${reward.recentHits || 0} / misses ${reward.recentMisses || 0}`;
+  if (scoreRewardReadoutEl) {
+    scoreRewardReadoutEl.textContent =
+      `scores ${reward.recentRightScores || 0} / opp ${reward.recentOpponentScores || 0}`;
   }
   const learning = activity?.learning || status?.learning || {};
   if (learningReadoutEl) {

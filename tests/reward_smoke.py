@@ -6,70 +6,63 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from snn_backend import PongSNN
 
 
-def world(ball_x=640, ball_y=180, ball_vx=200, right_y=170, left_score=0):
+def world(tick=0, reset_token=0, left_score=0, right_score=0):
     return {
-        "settings": {
-            "width": 800,
-            "height": 450,
-            "paddleHeight": 80,
-            "ballSize": 10,
-        },
-        "score": {"left": left_score, "right": 0},
-        "ball": {"x": ball_x, "y": ball_y, "vx": ball_vx, "vy": 0},
-        "paddles": {"rightY": right_y},
+        "resetToken": reset_token,
+        "tick": tick,
+        "authoritativeTick": tick,
+        "score": {"left": left_score, "right": right_score},
     }
 
 
-def component_after(model, frame, bars, winner):
-    value = model._reward_from_pong(frame, output_bars=bars, winner_index=winner)
-    return value, model.reward_state["components"]
+def reward_after(model, frame, winner):
+    value = model._reward_from_pong(frame, winner_index=winner)
+    return value, model.reward_state["components"], model.reward_state["metrics"]
 
 
-def test_confident_smooth_movement_gets_shaped_without_game_state_terms():
+def test_movement_costs_reward_and_hold_is_neutral_before_survival():
     model = PongSNN(seed=7)
 
-    component_after(model, world(right_y=170), [0.95, 0.1, 0.08], 0)
-    _, components = component_after(model, world(right_y=164), [0.96, 0.08, 0.05], 0)
+    hold_value, hold_components, _ = reward_after(model, world(tick=1), 2)
+    move_value, move_components, _ = reward_after(model, world(tick=2), 0)
 
-    assert components["outputConfidence"] > 0
-    assert components["chosenMovementPenalty"] < 0
-    assert components["smoothMotionReward"] > 0
-    assert components["directionChangePenalty"] == 0
-
-    _, components = component_after(model, world(right_y=172), [0.08, 0.96, 0.05], 1)
-    assert components["directionChangePenalty"] < 0
+    assert hold_value == 0.0
+    assert hold_components["movement"] == 0.0
+    assert move_components["movement"] < 0.0
+    assert move_value < 0.0
 
 
-def test_ambiguous_outputs_are_penalized_and_quiet_hold_can_be_rewarded():
+def test_survival_grows_slowly_with_episode_time():
     model = PongSNN(seed=8)
 
-    _, ambiguous = component_after(model, world(), [0.82, 0.78, 0.74], 0)
-    assert ambiguous["outputConfidence"] < 0
-    assert ambiguous["competingOutputPenalty"] < 0
-    assert ambiguous["movementOutputPenalty"] < 0
+    reward_after(model, world(tick=1), 2)
+    early_value, early_components, early_metrics = reward_after(model, world(tick=2), 2)
+    later_value, later_components, later_metrics = reward_after(model, world(tick=602), 2)
 
-    model.reward_function.reset()
-    _, quiet = component_after(model, world(), [0.04, 0.05, 1.0], 2)
-    assert quiet["quietOutputReward"] > 0
-    assert quiet["chosenMovementPenalty"] == 0
+    assert early_components["survival"] > 0.0
+    assert later_components["survival"] > early_components["survival"]
+    assert later_value > early_value
+    assert later_metrics["episodeSeconds"] > early_metrics["episodeSeconds"]
 
 
-def test_hit_and_miss_still_dominate_dense_shaping_terms():
-    hit_model = PongSNN(seed=9)
-    component_after(hit_model, world(ball_x=650, ball_vx=200), [0.04, 0.05, 1.0], 2)
-    hit_value, hit_components = component_after(hit_model, world(ball_x=660, ball_vx=-200), [0.04, 0.05, 1.0], 2)
-    assert hit_components["hit"] == 1.0
-    assert hit_value > 0.9
+def test_score_events_dominate_dense_rewards_and_reset_episode_timer():
+    model = PongSNN(seed=9)
 
-    miss_model = PongSNN(seed=10)
-    component_after(miss_model, world(left_score=0), [0.04, 0.05, 1.0], 2)
-    miss_value, miss_components = component_after(miss_model, world(left_score=1), [0.04, 0.05, 1.0], 2)
-    assert miss_components["miss"] == -1.0
-    assert miss_value < -0.9
+    reward_after(model, world(tick=1), 2)
+    right_value, right_components, right_metrics = reward_after(model, world(tick=600, right_score=1), 2)
+
+    assert right_components["rightScore"] > 3.0
+    assert right_value > 3.0
+    assert right_metrics["episodeSeconds"] > 0.0
+    assert model.reward_function.episode_ticks == 0
+
+    opponent_value, opponent_components, _ = reward_after(model, world(tick=700, right_score=1, left_score=1), 2)
+    assert opponent_components["opponentScore"] < -1.0
+    assert opponent_value < -1.0
 
 
 if __name__ == "__main__":
-    test_confident_smooth_movement_gets_shaped_without_game_state_terms()
-    test_ambiguous_outputs_are_penalized_and_quiet_hold_can_be_rewarded()
-    test_hit_and_miss_still_dominate_dense_shaping_terms()
+    test_movement_costs_reward_and_hold_is_neutral_before_survival()
+    test_survival_grows_slowly_with_episode_time()
+    test_score_events_dominate_dense_rewards_and_reset_episode_timer()
     print("reward smoke ok")
