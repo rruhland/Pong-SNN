@@ -89,9 +89,11 @@ The SNN logic is still the sparse event-camera network:
 - Output: `move up`, `move down`, `stay put`.
 
 Training uses reward-modulated STDP eligibility traces. Active pre plus active
-post increases a synapse group's eligibility trace, active pre without post
-decreases it slightly, and traces decay each SNN sample. Pong reward then gates
-weights with `weight += learning_rate * reward * eligibility`, clamped to the
+post increases each synapse group's fast, medium, and slow eligibility traces;
+active pre without post decreases them slightly. The traces decay independently
+at roughly 500 ms, 2 s, and 5 s scales, then combine as
+`fast + 0.35 * medium + 0.08 * slow`. Pong reward gates weights with
+`weight += learning_rate * reward * effective_eligibility`, clamped to the
 network's existing weight range.
 
 Reward is assembled from named, tunable components in `RewardFunction`, but the

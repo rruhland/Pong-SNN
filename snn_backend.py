@@ -19,6 +19,12 @@ REWARD_PARAMS = {
     "rightScore": {"value": 10},
 }
 
+ELIGIBILITY_TRACES = (
+    {"name": "fast", "decay": 0.92, "scale": 1.0, "horizonMs": 500},
+    {"name": "medium", "decay": 0.98, "scale": 0.35, "horizonMs": 2000},
+    {"name": "slow", "decay": 0.99, "scale": 0.08, "horizonMs": 5000},
+)
+
 
 def _clamp(value, low=0.0, high=1.0):
     return max(low, min(high, value))
@@ -171,12 +177,13 @@ class PongSNN:
         self.h2_h3_weights = self._build_weights(self.h2_h3_pre)
         self.h3_out_pre = [list(range(self.h3_size)) for _ in OUTPUTS]
         self.h3_out_weights = self._build_output_weights()
-        self.input_eligibility = [0.0 for _ in range(self.input_size)]
+        self.eligibility_traces = tuple(dict(trace) for trace in ELIGIBILITY_TRACES)
+        self.input_eligibility = self._build_flat_eligibility(self.input_size)
         self.h1_h2_eligibility = self._build_eligibility(self.h1_h2_pre)
         self.h2_h3_eligibility = self._build_eligibility(self.h2_h3_pre)
         self.h3_out_eligibility = self._build_eligibility(self.h3_out_pre)
         self.learning_rate = 0.006
-        self.eligibility_decay = 0.92
+        self.eligibility_decay = self.eligibility_traces[0]["decay"]
         self.eligibility_plus = 0.16
         self.eligibility_minus = 0.035
         self.last_pong_snapshot = None
@@ -219,8 +226,17 @@ class PongSNN:
     def _build_weights(self, projection):
         return [[self._rand_weight() for _ in pres] for pres in projection]
 
+    def _build_flat_eligibility(self, size):
+        return {trace["name"]: [0.0 for _ in range(size)] for trace in self.eligibility_traces}
+
     def _build_eligibility(self, projection):
-        return [[0.0 for _ in pres] for pres in projection]
+        return {
+            trace["name"]: [[0.0 for _ in pres] for pres in projection]
+            for trace in self.eligibility_traces
+        }
+
+    def _eligibility_trace_config(self):
+        return [dict(trace) for trace in self.eligibility_traces]
 
     def _build_output_weights(self):
         weights = []
@@ -279,6 +295,18 @@ class PongSNN:
         }
 
     def _empty_group_eligibility_stats(self, name, connections):
+        empty_trace_stats = {
+            trace["name"]: {
+                "name": trace["name"],
+                "connections": int(connections),
+                "active": 0,
+                "positive": 0,
+                "negative": 0,
+                "meanAbs": 0.0,
+                "maxAbs": 0.0,
+            }
+            for trace in self.eligibility_traces
+        }
         return {
             "name": name,
             "connections": int(connections),
@@ -287,6 +315,7 @@ class PongSNN:
             "negative": 0,
             "meanAbs": 0.0,
             "maxAbs": 0.0,
+            "traces": empty_trace_stats,
         }
 
     def _empty_learning_stats(self):
@@ -365,6 +394,8 @@ class PongSNN:
                 "mode": "reward-modulated eligibility traces",
                 "learningRate": self.learning_rate,
                 "eligibilityDecay": self.eligibility_decay,
+                "eligibilityTraces": self._eligibility_trace_config(),
+                "effectiveEligibility": "fast + 0.35 * medium + 0.08 * slow",
                 "eligibilityPlus": self.eligibility_plus,
                 "eligibilityMinus": self.eligibility_minus,
                 "rule": "local pre/post coactivity updates eligibility; reward gates weight changes",
@@ -434,22 +465,50 @@ class PongSNN:
     def _clamp_eligibility(self, value):
         return max(-1.0, min(1.0, value))
 
-    def _decay_flat_eligibility(self, eligibility):
+    def _decay_flat_eligibility(self, eligibility, decay):
         for index, value in enumerate(eligibility):
             if value == 0.0:
                 continue
-            decayed = value * self.eligibility_decay
+            decayed = value * decay
             eligibility[index] = 0.0 if abs(decayed) < 0.00001 else decayed
 
-    def _decay_nested_eligibility(self, eligibility):
+    def _decay_nested_eligibility(self, eligibility, decay):
         for row in eligibility:
-            self._decay_flat_eligibility(row)
+            self._decay_flat_eligibility(row, decay)
+
+    def _decay_flat_trace_set(self, eligibility):
+        for trace in self.eligibility_traces:
+            self._decay_flat_eligibility(eligibility[trace["name"]], trace["decay"])
+
+    def _decay_nested_trace_set(self, eligibility):
+        for trace in self.eligibility_traces:
+            self._decay_nested_eligibility(eligibility[trace["name"]], trace["decay"])
 
     def _decay_eligibilities(self):
-        self._decay_flat_eligibility(self.input_eligibility)
-        self._decay_nested_eligibility(self.h1_h2_eligibility)
-        self._decay_nested_eligibility(self.h2_h3_eligibility)
-        self._decay_nested_eligibility(self.h3_out_eligibility)
+        self._decay_flat_trace_set(self.input_eligibility)
+        self._decay_nested_trace_set(self.h1_h2_eligibility)
+        self._decay_nested_trace_set(self.h2_h3_eligibility)
+        self._decay_nested_trace_set(self.h3_out_eligibility)
+
+    def _add_flat_eligibility(self, eligibility, index, delta):
+        for trace in self.eligibility_traces:
+            values = eligibility[trace["name"]]
+            values[index] = self._clamp_eligibility(values[index] + delta)
+
+    def _add_nested_eligibility(self, eligibility, post, offset, delta):
+        for trace in self.eligibility_traces:
+            values = eligibility[trace["name"]][post]
+            values[offset] = self._clamp_eligibility(values[offset] + delta)
+
+    def _effective_flat_eligibility(self, eligibility):
+        first = eligibility[self.eligibility_traces[0]["name"]]
+        effective = []
+        for index in range(len(first)):
+            value = 0.0
+            for trace in self.eligibility_traces:
+                value += trace["scale"] * eligibility[trace["name"]][index]
+            effective.append(value)
+        return effective
 
     def _eligibility_stats_flat(self, name, eligibility):
         active = 0
@@ -479,16 +538,26 @@ class PongSNN:
             "maxAbs": round(max_abs, 6),
         }
 
-    def _eligibility_stats_nested(self, name, eligibility):
-        flat = [value for row in eligibility for value in row]
-        return self._eligibility_stats_flat(name, flat)
+    def _eligibility_trace_stats_flat(self, name, eligibility):
+        stats = self._eligibility_stats_flat(name, self._effective_flat_eligibility(eligibility))
+        stats["traces"] = {
+            trace["name"]: self._eligibility_stats_flat(trace["name"], eligibility[trace["name"]])
+            for trace in self.eligibility_traces
+        }
+        return stats
+
+    def _eligibility_trace_stats_nested(self, name, eligibility):
+        flat = {}
+        for trace in self.eligibility_traces:
+            flat[trace["name"]] = [value for row in eligibility[trace["name"]] for value in row]
+        return self._eligibility_trace_stats_flat(name, flat)
 
     def _summarize_eligibility(self):
         return {
-            "inputH1": self._eligibility_stats_flat("inputH1", self.input_eligibility),
-            "h1H2": self._eligibility_stats_nested("h1H2", self.h1_h2_eligibility),
-            "h2H3": self._eligibility_stats_nested("h2H3", self.h2_h3_eligibility),
-            "h3Output": self._eligibility_stats_nested("h3Output", self.h3_out_eligibility),
+            "inputH1": self._eligibility_trace_stats_flat("inputH1", self.input_eligibility),
+            "h1H2": self._eligibility_trace_stats_nested("h1H2", self.h1_h2_eligibility),
+            "h2H3": self._eligibility_trace_stats_nested("h2H3", self.h2_h3_eligibility),
+            "h3Output": self._eligibility_trace_stats_nested("h3Output", self.h3_out_eligibility),
         }
 
     def _eligibility_input(self, active_pixels, h1_spikes):
@@ -501,14 +570,10 @@ class PongSNN:
             hy = min(self.h1_h - 1, y // self.h1_cell)
             post = _grid_index(hx, hy, self.h1_w)
             if post in h1_active:
-                self.input_eligibility[pixel] = self._clamp_eligibility(
-                    self.input_eligibility[pixel] + self.eligibility_plus
-                )
+                self._add_flat_eligibility(self.input_eligibility, pixel, self.eligibility_plus)
                 changed["increased"] += 1
             else:
-                self.input_eligibility[pixel] = self._clamp_eligibility(
-                    self.input_eligibility[pixel] - self.eligibility_minus
-                )
+                self._add_flat_eligibility(self.input_eligibility, pixel, -self.eligibility_minus)
                 changed["decreased"] += 1
         return changed
 
@@ -518,20 +583,16 @@ class PongSNN:
         changed = {"increased": 0, "decreased": 0}
         if not pre_active:
             return changed
-        for post, (pres, post_eligibility) in enumerate(zip(projection, eligibility)):
+        for post, pres in enumerate(projection):
             active_post = post in post_active
             for offset, pre in enumerate(pres):
                 if pre not in pre_active:
                     continue
                 if active_post:
-                    post_eligibility[offset] = self._clamp_eligibility(
-                        post_eligibility[offset] + self.eligibility_plus
-                    )
+                    self._add_nested_eligibility(eligibility, post, offset, self.eligibility_plus)
                     changed["increased"] += 1
                 else:
-                    post_eligibility[offset] = self._clamp_eligibility(
-                        post_eligibility[offset] - self.eligibility_minus
-                    )
+                    self._add_nested_eligibility(eligibility, post, offset, -self.eligibility_minus)
                     changed["decreased"] += 1
         return changed
 
@@ -540,22 +601,23 @@ class PongSNN:
         changed = {"increased": 0, "decreased": 0}
         if not active:
             return changed
-        for output_index, (pres, eligibility) in enumerate(zip(self.h3_out_pre, self.h3_out_eligibility)):
+        for output_index, pres in enumerate(self.h3_out_pre):
             for offset, pre in enumerate(pres):
                 if pre not in active:
                     continue
                 if output_index == winner_index:
-                    eligibility[offset] = self._clamp_eligibility(eligibility[offset] + self.eligibility_plus)
+                    self._add_nested_eligibility(self.h3_out_eligibility, output_index, offset, self.eligibility_plus)
                     changed["increased"] += 1
                 else:
-                    eligibility[offset] = self._clamp_eligibility(eligibility[offset] - self.eligibility_minus)
+                    self._add_nested_eligibility(self.h3_out_eligibility, output_index, offset, -self.eligibility_minus)
                     changed["decreased"] += 1
         return changed
 
     def _apply_flat_reward(self, weights, eligibility, reward, stats):
         if reward == 0.0:
             return
-        for index, trace in enumerate(eligibility):
+        effective = self._effective_flat_eligibility(eligibility)
+        for index, trace in enumerate(effective):
             if abs(trace) <= 0.00001:
                 continue
             before = weights[index]
@@ -574,7 +636,11 @@ class PongSNN:
                 stats["depressed"] += 1
 
     def _apply_nested_reward(self, weights, eligibility, reward, stats):
-        for weight_row, eligibility_row in zip(weights, eligibility):
+        for row_index, weight_row in enumerate(weights):
+            eligibility_row = {
+                trace["name"]: eligibility[trace["name"]][row_index]
+                for trace in self.eligibility_traces
+            }
             self._apply_flat_reward(weight_row, eligibility_row, reward, stats)
 
     def _apply_rewarded_weights(self, reward, local_changes):

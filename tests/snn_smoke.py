@@ -112,8 +112,11 @@ def main():
         assert "survival" in status["reward"]["components"]
         assert "episodeSeconds" in status["reward"]["metrics"]
         assert "rewardComponents" in status["architecture"]["stdp"]
+        trace_names = [trace["name"] for trace in status["architecture"]["stdp"]["eligibilityTraces"]]
+        assert trace_names == ["fast", "medium", "slow"]
         assert "inputH1" in status["eligibility"]
         assert "h3Output" in status["eligibility"]
+        assert set(status["eligibility"]["inputH1"]["traces"]) == {"fast", "medium", "slow"}
         assert status["learning"]["step"] > 0
         assert status["runtime"]["samples"] > 0
         assert "eligibilityIncreased" in status["activity"]["stdp"]
