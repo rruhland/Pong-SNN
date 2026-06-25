@@ -66,7 +66,7 @@
     function mergeSettings(settings) {
       if (!runner.sim) return;
       runner.sim.settings = normalizeSessionSettings(settings);
-      runner.sim.left.speed = 320;
+      runner.sim.left.speed = 240;
       runner.sim.right.speed = 360;
       runner.sim.left.x = 24;
       runner.sim.right.x = runner.sim.settings.width - 34;
