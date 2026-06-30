@@ -34,12 +34,12 @@ def _grid_index(x, y, width):
     return y * width + x
 
 
-def _neighborhood(cx, cy, width, height, radius):
-    coords = []
-    for y in range(max(0, cy - radius), min(height, cy + radius + 1)):
-        for x in range(max(0, cx - radius), min(width, cx + radius + 1)):
-            coords.append(_grid_index(x, y, width))
-    return coords
+def _sigmoid(value):
+    if value < -30:
+        return 0.0
+    if value > 30:
+        return 1.0
+    return 1.0 / (1.0 + math.exp(-value))
 
 
 class RewardFunction:
@@ -131,15 +131,192 @@ class RewardFunction:
         return winner_index
 
 
+class SynapseGroup:
+    def __init__(self, name, pre_size, post_size, edges, traces):
+        self.name = name
+        self.pre_size = int(pre_size)
+        self.post_size = int(post_size)
+        self.pre = [int(edge[0]) for edge in edges]
+        self.post = [int(edge[1]) for edge in edges]
+        self.weight = [float(edge[2]) for edge in edges]
+        self.low = [float(edge[3]) for edge in edges]
+        self.high = [float(edge[4]) for edge in edges]
+        self.traces = tuple(dict(trace) for trace in traces)
+        self.eligibility = {
+            trace["name"]: [0.0 for _ in self.weight]
+            for trace in self.traces
+        }
+        self.active_edges = set()
+        self.by_pre = [[] for _ in range(self.pre_size)]
+        for index, pre in enumerate(self.pre):
+            if 0 <= pre < self.pre_size:
+                self.by_pre[pre].append(index)
+
+    def __len__(self):
+        return len(self.weight)
+
+    def decay(self):
+        if not self.active_edges:
+            return
+        still_active = set()
+        for trace in self.traces:
+            values = self.eligibility[trace["name"]]
+            decay = trace["decay"]
+            for index in self.active_edges:
+                value = values[index]
+                if value == 0.0:
+                    continue
+                decayed = value * decay
+                values[index] = 0.0 if abs(decayed) < 0.00001 else decayed
+                if values[index] != 0.0:
+                    still_active.add(index)
+        self.active_edges = still_active
+
+    def add_eligibility(self, edge_index, delta):
+        is_active = False
+        for trace in self.traces:
+            values = self.eligibility[trace["name"]]
+            values[edge_index] = max(-1.0, min(1.0, values[edge_index] + delta))
+            if abs(values[edge_index]) > 0.00001:
+                is_active = True
+        if is_active:
+            self.active_edges.add(edge_index)
+        else:
+            self.active_edges.discard(edge_index)
+
+    def effective(self, edge_index):
+        value = 0.0
+        for trace in self.traces:
+            value += trace["scale"] * self.eligibility[trace["name"]][edge_index]
+        return value
+
+    def effective_values(self):
+        return [self.effective(index) for index in self.active_edges]
+
+    def apply_modulator(self, learning_rate, modulator, stats):
+        if modulator == 0.0:
+            return
+        for index in list(self.active_edges):
+            before = self.weight[index]
+            trace = self.effective(index)
+            if abs(trace) <= 0.00001:
+                continue
+            delta = learning_rate * modulator * trace
+            after = max(self.low[index], min(self.high[index], before + delta))
+            if after == before:
+                continue
+            self.weight[index] = after
+            stats["weightUpdates"] += 1
+            stats["meanAbsDelta"] += abs(after - before)
+            if after == self.low[index] or after == self.high[index]:
+                stats["clamped"] += 1
+            if after > before:
+                stats["potentiated"] += 1
+            else:
+                stats["depressed"] += 1
+
+    def apply_post_errors(self, learning_rate, post_errors, stats):
+        if not post_errors:
+            return
+        for index in list(self.active_edges):
+            post = self.post[index]
+            error = post_errors.get(post)
+            if error is None:
+                continue
+            trace = self.effective(index)
+            if abs(trace) <= 0.00001:
+                continue
+            before = self.weight[index]
+            delta = learning_rate * error * trace
+            after = max(self.low[index], min(self.high[index], before + delta))
+            if after == before:
+                continue
+            self.weight[index] = after
+            stats["predictionWeightUpdates"] += 1
+            stats["weightUpdates"] += 1
+            stats["meanAbsDelta"] += abs(after - before)
+            if after == self.low[index] or after == self.high[index]:
+                stats["clamped"] += 1
+            if after > before:
+                stats["potentiated"] += 1
+            else:
+                stats["depressed"] += 1
+
+    def stats(self):
+        active = 0
+        positive = 0
+        negative = 0
+        total_abs = 0.0
+        max_abs = 0.0
+        for index in self.active_edges:
+            value = self.effective(index)
+            magnitude = abs(value)
+            if magnitude <= 0.00001:
+                continue
+            active += 1
+            total_abs += magnitude
+            max_abs = max(max_abs, magnitude)
+            if value > 0:
+                positive += 1
+            else:
+                negative += 1
+        return {
+            "name": self.name,
+            "connections": len(self.weight),
+            "active": active,
+            "positive": positive,
+            "negative": negative,
+            "meanAbs": round(total_abs / max(1, len(self.weight)), 6),
+            "maxAbs": round(max_abs, 6),
+            "traces": {
+                trace["name"]: self._trace_stats(trace["name"])
+                for trace in self.traces
+            },
+        }
+
+    def _trace_stats(self, name):
+        values = self.eligibility[name]
+        active = 0
+        positive = 0
+        negative = 0
+        total_abs = 0.0
+        max_abs = 0.0
+        for index in self.active_edges:
+            value = values[index]
+            magnitude = abs(value)
+            if magnitude <= 0.00001:
+                continue
+            active += 1
+            total_abs += magnitude
+            max_abs = max(max_abs, magnitude)
+            if value > 0:
+                positive += 1
+            else:
+                negative += 1
+        return {
+            "name": name,
+            "connections": len(values),
+            "active": active,
+            "positive": positive,
+            "negative": negative,
+            "meanAbs": round(total_abs / max(1, len(values)), 6),
+            "maxAbs": round(max_abs, 6),
+        }
+
+    def to_dict(self):
+        return {"weights": self.weight}
+
+    def load_weights(self, payload):
+        weights = payload.get("weights", [])
+        if len(weights) != len(self.weight):
+            raise ValueError(f"saved {self.name} weights do not match this architecture")
+        self.weight = [max(self.low[index], min(self.high[index], float(value))) for index, value in enumerate(weights)]
+
+
 class PongSNN:
-    """Sparse, backend-owned SNN scaffold for Pong event-camera input.
+    """Compressed event-camera SNN with a recurrent predictive hidden cloud."""
 
-    The implementation is intentionally small and dependency-free. It keeps a
-    GPU-ready device descriptor and tensor-friendly dense weight arrays, while
-    the first pass runs as sparse Python updates so the API works without CUDA.
-    """
-
-    version = 1
+    version = 2
 
     def __init__(self, width=800, height=450, seed=None, save_dir=None):
         self.width = int(width)
@@ -157,43 +334,76 @@ class PongSNN:
         self.loaded_from = None
         self.device = self._detect_device()
 
-        self.h1_cell = 10
-        self.h1_w = math.ceil(self.width / self.h1_cell)
-        self.h1_h = math.ceil(self.height / self.h1_cell)
-        self.h2_w = math.ceil(self.h1_w / 2)
-        self.h2_h = math.ceil(self.h1_h / 2)
-        self.h3_w = math.ceil(self.h2_w / 2)
-        self.h3_h = math.ceil(self.h2_h / 2)
+        self.input_w = 64
+        self.input_h = 36
+        self.input_size = self.input_w * self.input_h
+        self.motor_size = len(OUTPUTS)
+        self.hidden_size = 5000
+        self.hidden_w = 100
+        self.hidden_h = 50
+        self.excitatory_count = int(self.hidden_size * 0.8)
+        self.inhibitory_count = self.hidden_size - self.excitatory_count
 
-        self.h1_size = self.h1_w * self.h1_h
-        self.h2_size = self.h2_w * self.h2_h
-        self.h3_size = self.h3_w * self.h3_h
-        self.input_size = self.width * self.height
-
-        self.input_weights = [self._rand_weight() for _ in range(self.input_size)]
-        self.h1_h2_pre = self._build_projection(self.h1_w, self.h1_h, self.h2_w, self.h2_h, radius=1)
-        self.h2_h3_pre = self._build_projection(self.h2_w, self.h2_h, self.h3_w, self.h3_h, radius=2)
-        self.h1_h2_weights = self._build_weights(self.h1_h2_pre)
-        self.h2_h3_weights = self._build_weights(self.h2_h3_pre)
-        self.h3_out_pre = [list(range(self.h3_size)) for _ in OUTPUTS]
-        self.h3_out_weights = self._build_output_weights()
+        self.learning_rate = 0.0045
+        self.prediction_learning_rate = 0.018
+        self.predictive_modulation_scale = 0.18
+        self.status_summary_interval = 10
+        self.eligibility_plus = 0.14
+        self.eligibility_minus = 0.03
         self.eligibility_traces = tuple(dict(trace) for trace in ELIGIBILITY_TRACES)
-        self.input_eligibility = self._build_flat_eligibility(self.input_size)
-        self.h1_h2_eligibility = self._build_eligibility(self.h1_h2_pre)
-        self.h2_h3_eligibility = self._build_eligibility(self.h2_h3_pre)
-        self.h3_out_eligibility = self._build_eligibility(self.h3_out_pre)
-        self.learning_rate = 0.006
         self.eligibility_decay = self.eligibility_traces[0]["decay"]
-        self.eligibility_plus = 0.16
-        self.eligibility_minus = 0.035
+        self.motor_trace_decay = 0.86
+
+        self.hidden_potential = [0.0 for _ in range(self.hidden_size)]
+        self.last_hidden_spikes = []
+        self.previous_action_traces = [0.0, 0.0, 1.0]
+        self.last_prediction = {}
+        self.last_prediction_edges = 0
         self.last_pong_snapshot = None
         self.reward_function = RewardFunction()
         self.recent_right_scores = 0
         self.recent_opponent_scores = 0
         self.reward_state = self._empty_reward_state()
-        self.eligibility_stats = self._empty_eligibility_stats()
         self.learning_stats = self._empty_learning_stats()
+        self.prediction_state = self._empty_prediction_state()
 
+        self.neuron_is_excitatory = self._build_neuron_types()
+        self.input_hidden = SynapseGroup(
+            "inputHidden",
+            self.input_size,
+            self.hidden_size,
+            self._build_input_hidden_edges(),
+            self.eligibility_traces,
+        )
+        self.motor_hidden = SynapseGroup(
+            "motorHidden",
+            self.motor_size,
+            self.hidden_size,
+            self._build_motor_hidden_edges(),
+            self.eligibility_traces,
+        )
+        self.recurrent = SynapseGroup(
+            "recurrentCloud",
+            self.hidden_size,
+            self.hidden_size,
+            self._build_recurrent_edges(),
+            self.eligibility_traces,
+        )
+        self.hidden_output = SynapseGroup(
+            "hiddenOutput",
+            self.hidden_size,
+            self.motor_size,
+            self._build_output_edges(),
+            self.eligibility_traces,
+        )
+        self.hidden_prediction = SynapseGroup(
+            "predictionHead",
+            self.hidden_size,
+            self.input_size,
+            self._build_prediction_edges(),
+            self.eligibility_traces,
+        )
+        self.eligibility_stats = self._empty_eligibility_stats()
         self.activity = self._empty_activity()
 
     def _detect_device(self):
@@ -211,54 +421,119 @@ class PongSNN:
             info["note"] = f"torch unavailable: {exc.__class__.__name__}"
         return info
 
-    def _rand_weight(self):
-        return 0.34 + self.rng.random() * 0.32
+    def _build_neuron_types(self):
+        types = [True] * self.excitatory_count + [False] * self.inhibitory_count
+        self.rng.shuffle(types)
+        return types
 
-    def _build_projection(self, pre_w, pre_h, post_w, post_h, radius):
-        projection = []
-        for py in range(post_h):
-            for px in range(post_w):
-                cx = min(pre_w - 1, round((px + 0.5) * pre_w / post_w - 0.5))
-                cy = min(pre_h - 1, round((py + 0.5) * pre_h / post_h - 0.5))
-                projection.append(_neighborhood(cx, cy, pre_w, pre_h, radius))
-        return projection
+    def _hidden_xy(self, index):
+        return index % self.hidden_w, index // self.hidden_w
 
-    def _build_weights(self, projection):
-        return [[self._rand_weight() for _ in pres] for pres in projection]
+    def _hidden_index(self, x, y):
+        return _grid_index(x % self.hidden_w, y % self.hidden_h, self.hidden_w)
 
-    def _build_flat_eligibility(self, size):
-        return {trace["name"]: [0.0 for _ in range(size)] for trace in self.eligibility_traces}
+    def _input_to_hidden_center(self, input_index):
+        x = input_index % self.input_w
+        y = input_index // self.input_w
+        hx = int((x + 0.5) * self.hidden_w / self.input_w)
+        hy = int((y + 0.5) * self.hidden_h / self.input_h)
+        return min(self.hidden_w - 1, hx), min(self.hidden_h - 1, hy)
 
-    def _build_eligibility(self, projection):
-        return {
-            trace["name"]: [[0.0 for _ in pres] for pres in projection]
-            for trace in self.eligibility_traces
-        }
+    def _signed_bounds(self, pre):
+        return (0.0, 1.0) if self.neuron_is_excitatory[pre] else (-1.0, 0.0)
 
-    def _eligibility_trace_config(self):
-        return [dict(trace) for trace in self.eligibility_traces]
+    def _signed_weight(self, pre, low_abs, high_abs):
+        magnitude = low_abs + self.rng.random() * (high_abs - low_abs)
+        return magnitude if self.neuron_is_excitatory[pre] else -magnitude
 
-    def _build_output_weights(self):
-        weights = []
-        for output_index, output in enumerate(OUTPUTS):
-            output_weights = []
-            for pre in self.h3_out_pre[output_index]:
-                y = pre // self.h3_w
-                vertical = y / max(1, self.h3_h - 1)
+    def _build_input_hidden_edges(self):
+        edges = []
+        offsets = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+        for pre in range(self.input_size):
+            cx, cy = self._input_to_hidden_center(pre)
+            for dx, dy in offsets:
+                hx = max(0, min(self.hidden_w - 1, cx + dx))
+                hy = max(0, min(self.hidden_h - 1, cy + dy))
+                post = self._hidden_index(hx, hy)
+                weight = 0.34 + self.rng.random() * 0.38
+                edges.append((pre, post, weight, 0.0, 1.0))
+        return edges
+
+    def _build_motor_hidden_edges(self):
+        edges = []
+        per_action = 420
+        for pre in range(self.motor_size):
+            target_y = (pre + 0.5) * self.hidden_h / self.motor_size
+            for _ in range(per_action):
+                hx = self.rng.randrange(self.hidden_w)
+                hy = int(max(0, min(self.hidden_h - 1, self.rng.gauss(target_y, self.hidden_h * 0.18))))
+                post = self._hidden_index(hx, hy)
+                weight = 0.08 + self.rng.random() * 0.26
+                edges.append((pre, post, weight, 0.0, 1.0))
+        return edges
+
+    def _build_recurrent_edges(self):
+        edges = []
+        nearby = 18
+        long_range = 6
+        for pre in range(self.hidden_size):
+            px, py = self._hidden_xy(pre)
+            low, high = self._signed_bounds(pre)
+            for _ in range(nearby):
+                dx = int(round(self.rng.gauss(0, 3.2)))
+                dy = int(round(self.rng.gauss(0, 2.1)))
+                post = self._hidden_index(px + dx, py + dy)
+                if post == pre:
+                    post = self._hidden_index(px + 1, py)
+                weight = self._signed_weight(pre, 0.22, 0.72)
+                edges.append((pre, post, weight, low, high))
+            for _ in range(long_range):
+                post = self.rng.randrange(self.hidden_size)
+                if post == pre:
+                    post = (post + 1) % self.hidden_size
+                weight = self._signed_weight(pre, 0.025, 0.16)
+                edges.append((pre, post, weight, low, high))
+        return edges
+
+    def _build_output_edges(self):
+        edges = []
+        for pre in range(self.hidden_size):
+            _, hy = self._hidden_xy(pre)
+            vertical = hy / max(1, self.hidden_h - 1)
+            low, high = self._signed_bounds(pre)
+            for post, output in enumerate(OUTPUTS):
                 if output["direction"] == -1:
-                    bias = 0.14 * (1.0 - vertical)
+                    bias = 0.055 * (1.0 - vertical)
                 elif output["direction"] == 1:
-                    bias = 0.14 * vertical
+                    bias = 0.055 * vertical
                 else:
-                    bias = 0.04
-                output_weights.append(_clamp(self._rand_weight() + bias, 0.05, 0.95))
-            weights.append(output_weights)
-        return weights
+                    bias = 0.03
+                magnitude = 0.01 + self.rng.random() * 0.08 + bias
+                weight = magnitude if self.neuron_is_excitatory[pre] else -magnitude
+                edges.append((pre, post, weight, low, high))
+        return edges
+
+    def _build_prediction_edges(self):
+        edges = []
+        offsets = ((0, 0), (-1, 0), (1, 0), (0, -1))
+        for pre in range(self.hidden_size):
+            hx, hy = self._hidden_xy(pre)
+            gx = int((hx + 0.5) * self.input_w / self.hidden_w)
+            gy = int((hy + 0.5) * self.input_h / self.hidden_h)
+            low, high = self._signed_bounds(pre)
+            for dx, dy in offsets:
+                px = max(0, min(self.input_w - 1, gx + dx))
+                py = max(0, min(self.input_h - 1, gy + dy))
+                post = _grid_index(px, py, self.input_w)
+                weight = self._signed_weight(pre, 0.04, 0.22)
+                edges.append((pre, post, weight, low, high))
+        return edges
 
     def _empty_activity(self):
         return {
             "tick": 0,
             "eventCount": 0,
+            "compressedEventCount": 0,
             "spikes": {"input": 0, "hidden1": 0, "hidden2": 0, "hidden3": 0, "output": 0},
             "outputDrive": [0.0, 0.0, 0.0],
             "outputBars": [0.0, 0.0, 0.0],
@@ -268,6 +543,8 @@ class PongSNN:
             "activeHidden1": [],
             "activeHidden2": [],
             "activeHidden3": [],
+            "motorTraces": list(self.previous_action_traces),
+            "prediction": self._empty_prediction_state(),
             "stdp": {
                 "potentiated": 0,
                 "depressed": 0,
@@ -286,44 +563,39 @@ class PongSNN:
             "recentOpponentScores": self.recent_opponent_scores,
         }
 
-    def _empty_eligibility_stats(self):
+    def _empty_prediction_state(self):
         return {
-            "inputH1": self._empty_group_eligibility_stats("inputH1", self.input_size),
-            "h1H2": self._empty_group_eligibility_stats("h1H2", sum(len(row) for row in self.h1_h2_pre)),
-            "h2H3": self._empty_group_eligibility_stats("h2H3", sum(len(row) for row in self.h2_h3_pre)),
-            "h3Output": self._empty_group_eligibility_stats("h3Output", sum(len(row) for row in self.h3_out_pre)),
+            "gridWidth": self.input_w,
+            "gridHeight": self.input_h,
+            "actualActive": 0,
+            "predictedActive": 0,
+            "hits": 0,
+            "misses": 0,
+            "falsePositives": 0,
+            "meanAbsError": 0.0,
+            "modulatorySignal": 0.0,
+            "sample": [],
         }
 
-    def _empty_group_eligibility_stats(self, name, connections):
-        empty_trace_stats = {
-            trace["name"]: {
-                "name": trace["name"],
-                "connections": int(connections),
-                "active": 0,
-                "positive": 0,
-                "negative": 0,
-                "meanAbs": 0.0,
-                "maxAbs": 0.0,
-            }
-            for trace in self.eligibility_traces
-        }
+    def _empty_eligibility_stats(self):
         return {
-            "name": name,
-            "connections": int(connections),
-            "active": 0,
-            "positive": 0,
-            "negative": 0,
-            "meanAbs": 0.0,
-            "maxAbs": 0.0,
-            "traces": empty_trace_stats,
+            "inputH1": self.input_hidden.stats(),
+            "motorContext": self.motor_hidden.stats(),
+            "recurrentCloud": self.recurrent.stats(),
+            "predictionHead": self.hidden_prediction.stats(),
+            "h3Output": self.hidden_output.stats(),
         }
 
     def _empty_learning_stats(self):
         return {
             "step": self.train_steps,
             "learningRate": self.learning_rate,
+            "predictionLearningRate": self.prediction_learning_rate,
             "rewardApplied": 0.0,
+            "predictionApplied": 0.0,
+            "combinedModulator": 0.0,
             "weightUpdates": 0,
+            "predictionWeightUpdates": 0,
             "potentiated": 0,
             "depressed": 0,
             "clamped": 0,
@@ -333,80 +605,92 @@ class PongSNN:
         }
 
     def architecture(self):
-        input_connections = self.input_size
-        h1_h2_connections = sum(len(pres) for pres in self.h1_h2_pre)
-        h2_h3_connections = sum(len(pres) for pres in self.h2_h3_pre)
-        output_connections = sum(len(pres) for pres in self.h3_out_pre)
-        total_possible_first = self.input_size * self.h1_size
-        total_connections = input_connections + h1_h2_connections + h2_h3_connections + output_connections
+        total_connections = (
+            len(self.input_hidden)
+            + len(self.motor_hidden)
+            + len(self.recurrent)
+            + len(self.hidden_output)
+            + len(self.hidden_prediction)
+        )
         return {
             "version": self.version,
             "device": self.device,
             "input": {
-                "name": "event camera pixels",
-                "width": self.width,
-                "height": self.height,
+                "name": "compressed event camera grid",
+                "sourceWidth": self.width,
+                "sourceHeight": self.height,
+                "width": self.input_w,
+                "height": self.input_h,
                 "neurons": self.input_size,
-                "activeRule": "only changed event-camera pixels spike",
+                "activeRule": "any event-camera pixel in a 64x36 cell spikes that cell",
+            },
+            "motorContext": {
+                "neurons": self.motor_size,
+                "labels": [item["name"] for item in OUTPUTS],
+                "traceDecay": self.motor_trace_decay,
+                "activeRule": "previous action is fed back through decaying traces",
             },
             "layers": [
                 {
                     "name": "hidden1",
-                    "width": self.h1_w,
-                    "height": self.h1_h,
-                    "neurons": self.h1_size,
-                    "receptiveField": "10x10 input-pixel chunks",
-                    "connections": input_connections,
+                    "role": "recurrent hidden cloud",
+                    "width": self.hidden_w,
+                    "height": self.hidden_h,
+                    "neurons": self.hidden_size,
+                    "excitatory": self.excitatory_count,
+                    "inhibitory": self.inhibitory_count,
+                    "receptiveField": "sparse distance-biased recurrence",
+                    "connections": len(self.recurrent),
                 },
                 {
-                    "name": "hidden2",
-                    "width": self.h2_w,
-                    "height": self.h2_h,
-                    "neurons": self.h2_size,
-                    "receptiveField": "3x3 hidden1 neighborhoods",
-                    "connections": h1_h2_connections,
-                },
-                {
-                    "name": "hidden3",
-                    "width": self.h3_w,
-                    "height": self.h3_h,
-                    "neurons": self.h3_size,
-                    "receptiveField": "5x5 hidden2 neighborhoods",
-                    "connections": h2_h3_connections,
+                    "name": "prediction",
+                    "role": "next event grid prediction head",
+                    "width": self.input_w,
+                    "height": self.input_h,
+                    "neurons": self.input_size,
+                    "receptiveField": "local hidden-cloud readout",
+                    "connections": len(self.hidden_prediction),
                 },
                 {
                     "name": "output",
+                    "role": "motor output",
                     "width": 3,
                     "height": 1,
                     "neurons": 3,
-                    "receptiveField": "sparse readout from hidden3",
-                    "connections": output_connections,
+                    "receptiveField": "hidden-cloud readout",
+                    "connections": len(self.hidden_output),
                     "labels": [item["name"] for item in OUTPUTS],
                 },
             ],
             "sparsity": {
-                "firstLayerConnections": input_connections,
-                "firstLayerAllToAllWouldBe": total_possible_first,
-                "firstLayerDensity": input_connections / total_possible_first,
+                "inputHiddenConnections": len(self.input_hidden),
+                "motorContextConnections": len(self.motor_hidden),
+                "recurrentConnections": len(self.recurrent),
+                "predictionConnections": len(self.hidden_prediction),
+                "outputConnections": len(self.hidden_output),
                 "totalConnections": total_connections,
             },
             "stdp": {
-                "mode": "reward-modulated eligibility traces",
+                "mode": "reward and prediction-error modulated eligibility traces",
                 "learningRate": self.learning_rate,
+                "predictionLearningRate": self.prediction_learning_rate,
                 "eligibilityDecay": self.eligibility_decay,
                 "eligibilityTraces": self._eligibility_trace_config(),
                 "effectiveEligibility": "fast + 0.35 * medium + 0.08 * slow",
                 "eligibilityPlus": self.eligibility_plus,
                 "eligibilityMinus": self.eligibility_minus,
-                "rule": "local pre/post coactivity updates eligibility; reward gates weight changes",
+                "rule": "local pre/post coactivity updates eligibility; reward and predictive error gate weight changes",
                 "rewardComponents": self.reward_function.config(),
             },
         }
 
-    def _input_to_h1(self, pixels):
-        drives = [0.0] * self.h1_size
+    def _eligibility_trace_config(self):
+        return [dict(trace) for trace in self.eligibility_traces]
+
+    def _compress_events(self, pixels, camera_width, camera_height):
         active_pixels = []
-        max_index = self.input_size
+        active_cells = set()
+        max_index = camera_width * camera_height
         for raw_pixel in pixels:
             try:
                 pixel = int(raw_pixel)
@@ -415,244 +699,178 @@ class PongSNN:
             if pixel < 0 or pixel >= max_index:
                 continue
             active_pixels.append(pixel)
-            y = pixel // self.width
-            x = pixel - y * self.width
-            hx = min(self.h1_w - 1, x // self.h1_cell)
-            hy = min(self.h1_h - 1, y // self.h1_cell)
-            drives[_grid_index(hx, hy, self.h1_w)] += self.input_weights[pixel]
-        return active_pixels, drives
+            y = pixel // camera_width
+            x = pixel - y * camera_width
+            cx = min(self.input_w - 1, int(x * self.input_w / max(1, camera_width)))
+            cy = min(self.input_h - 1, int(y * self.input_h / max(1, camera_height)))
+            active_cells.add(_grid_index(cx, cy, self.input_w))
+        return active_pixels, sorted(active_cells)
 
-    def _spikes_from_drives(self, drives, threshold, max_spikes):
-        indexed = [(index, drive) for index, drive in enumerate(drives) if drive > 0.0]
-        if not indexed:
-            return []
-        spikes = [index for index, drive in indexed if drive >= threshold]
-        if not spikes:
-            strongest = max(indexed, key=lambda item: item[1])
-            spikes = [strongest[0]]
-        if len(spikes) > max_spikes:
-            strongest = sorted(((index, drives[index]) for index in spikes), key=lambda item: item[1], reverse=True)
-            spikes = [index for index, _ in strongest[:max_spikes]]
+    def _add_group_drive(self, drive, group, active_pres, scale=1.0):
+        for pre in active_pres:
+            if pre < 0 or pre >= group.pre_size:
+                continue
+            for edge_index in group.by_pre[pre]:
+                drive[group.post[edge_index]] += group.weight[edge_index] * scale
+
+    def _add_motor_drive(self, drive):
+        for pre, trace in enumerate(self.previous_action_traces):
+            if trace <= 0.005:
+                continue
+            self._add_group_drive(drive, self.motor_hidden, (pre,), trace)
+
+    def _hidden_spikes(self, drive):
+        candidates = []
+        for index, incoming in enumerate(drive):
+            value = self.hidden_potential[index] * 0.80 + incoming
+            self.hidden_potential[index] = value
+            if value >= 0.42:
+                candidates.append((index, value))
+        if not candidates:
+            strongest = sorted(((index, value) for index, value in enumerate(drive) if value > 0.0), key=lambda item: item[1], reverse=True)
+            candidates = strongest[:16]
+        if len(candidates) > 220:
+            candidates = sorted(candidates, key=lambda item: item[1], reverse=True)[:220]
+        spikes = [index for index, _ in candidates]
+        for index in spikes:
+            self.hidden_potential[index] *= 0.18
         return spikes
 
-    def _project(self, pre_spikes, projection, weights):
-        active = set(pre_spikes)
-        drives = []
-        for pres, post_weights in zip(projection, weights):
-            drive = 0.0
-            for offset, pre in enumerate(pres):
-                if pre in active:
-                    drive += post_weights[offset]
-            drives.append(drive)
-        return drives
-
-    def _output(self, h3_spikes):
-        active = set(h3_spikes)
-        drives = []
-        for pres, weights in zip(self.h3_out_pre, self.h3_out_weights):
-            drive = 0.0
-            for offset, pre in enumerate(pres):
-                if pre in active:
-                    drive += weights[offset]
-            drives.append(drive)
-        if max(drives, default=0.0) <= 0.0:
+    def _output(self, hidden_spikes):
+        drives = [0.0, 0.0, 0.035]
+        for pre in hidden_spikes:
+            for edge_index in self.hidden_output.by_pre[pre]:
+                drives[self.hidden_output.post[edge_index]] += self.hidden_output.weight[edge_index]
+        if not hidden_spikes:
             winner_index = 2
         else:
             winner_index = max(range(len(drives)), key=lambda index: drives[index])
-        max_drive = max(1.0, max(drives, default=0.0))
-        return drives, [drive / max_drive for drive in drives], winner_index
+        low = min(drives)
+        high = max(drives)
+        if high - low <= 0.00001:
+            bars = [0.0, 0.0, 1.0]
+        else:
+            bars = [(value - low) / (high - low) for value in drives]
+        return drives, bars, winner_index
 
-    def _clamp_eligibility(self, value):
-        return max(-1.0, min(1.0, value))
+    def _predict_next(self, hidden_spikes):
+        scores = {}
+        edge_count = 0
+        for pre in hidden_spikes:
+            for edge_index in self.hidden_prediction.by_pre[pre]:
+                post = self.hidden_prediction.post[edge_index]
+                scores[post] = scores.get(post, 0.0) + self.hidden_prediction.weight[edge_index]
+                edge_count += 1
+        prediction = {}
+        for post, score in scores.items():
+            probability = _sigmoid(score - 0.28)
+            if probability >= 0.08:
+                prediction[post] = probability
+        self.last_prediction_edges = edge_count
+        return prediction
 
-    def _decay_flat_eligibility(self, eligibility, decay):
-        for index, value in enumerate(eligibility):
-            if value == 0.0:
-                continue
-            decayed = value * decay
-            eligibility[index] = 0.0 if abs(decayed) < 0.00001 else decayed
+    def _prediction_error(self, active_cells):
+        actual = set(active_cells)
+        predicted = {cell for cell, probability in self.last_prediction.items() if probability >= 0.32}
+        union = actual | set(self.last_prediction)
+        if not union:
+            self.prediction_state = self._empty_prediction_state()
+            return 0.0, {}
 
-    def _decay_nested_eligibility(self, eligibility, decay):
-        for row in eligibility:
-            self._decay_flat_eligibility(row, decay)
+        post_errors = {}
+        total_abs = 0.0
+        hits = 0
+        misses = 0
+        false_positives = 0
+        for cell in union:
+            target = 1.0 if cell in actual else 0.0
+            probability = self.last_prediction.get(cell, 0.0)
+            error = target - probability
+            total_abs += abs(error)
+            if abs(error) >= 0.02:
+                post_errors[cell] = error
+            if cell in actual and cell in predicted:
+                hits += 1
+            elif cell in actual:
+                misses += 1
+            elif cell in predicted:
+                false_positives += 1
 
-    def _decay_flat_trace_set(self, eligibility):
-        for trace in self.eligibility_traces:
-            self._decay_flat_eligibility(eligibility[trace["name"]], trace["decay"])
-
-    def _decay_nested_trace_set(self, eligibility):
-        for trace in self.eligibility_traces:
-            self._decay_nested_eligibility(eligibility[trace["name"]], trace["decay"])
+        mean_abs = total_abs / max(1, len(union))
+        quality = (hits - misses - false_positives) / max(1, len(actual) + len(predicted))
+        modulatory = max(-1.0, min(1.0, quality))
+        self.prediction_state = {
+            "gridWidth": self.input_w,
+            "gridHeight": self.input_h,
+            "actualActive": len(actual),
+            "predictedActive": len(predicted),
+            "hits": hits,
+            "misses": misses,
+            "falsePositives": false_positives,
+            "meanAbsError": round(mean_abs, 5),
+            "modulatorySignal": round(modulatory, 5),
+            "sample": sorted(predicted)[:900],
+        }
+        return modulatory, post_errors
 
     def _decay_eligibilities(self):
-        self._decay_flat_trace_set(self.input_eligibility)
-        self._decay_nested_trace_set(self.h1_h2_eligibility)
-        self._decay_nested_trace_set(self.h2_h3_eligibility)
-        self._decay_nested_trace_set(self.h3_out_eligibility)
+        self.input_hidden.decay()
+        self.motor_hidden.decay()
+        self.recurrent.decay()
+        self.hidden_output.decay()
+        self.hidden_prediction.decay()
 
-    def _add_flat_eligibility(self, eligibility, index, delta):
-        for trace in self.eligibility_traces:
-            values = eligibility[trace["name"]]
-            values[index] = self._clamp_eligibility(values[index] + delta)
-
-    def _add_nested_eligibility(self, eligibility, post, offset, delta):
-        for trace in self.eligibility_traces:
-            values = eligibility[trace["name"]][post]
-            values[offset] = self._clamp_eligibility(values[offset] + delta)
-
-    def _effective_flat_eligibility(self, eligibility):
-        first = eligibility[self.eligibility_traces[0]["name"]]
-        effective = []
-        for index in range(len(first)):
-            value = 0.0
-            for trace in self.eligibility_traces:
-                value += trace["scale"] * eligibility[trace["name"]][index]
-            effective.append(value)
-        return effective
-
-    def _eligibility_stats_flat(self, name, eligibility):
-        active = 0
-        positive = 0
-        negative = 0
-        total_abs = 0.0
-        max_abs = 0.0
-        for value in eligibility:
-            magnitude = abs(value)
-            if magnitude <= 0.00001:
+    def _update_pre_post_eligibility(self, group, active_pres, active_posts, plus=None, minus=None, pre_scales=None):
+        active_post_set = set(active_posts)
+        changed = {"increased": 0, "decreased": 0}
+        plus = self.eligibility_plus if plus is None else plus
+        minus = self.eligibility_minus if minus is None else minus
+        for pre in active_pres:
+            if pre < 0 or pre >= group.pre_size:
                 continue
-            active += 1
-            total_abs += magnitude
-            max_abs = max(max_abs, magnitude)
-            if value > 0:
-                positive += 1
-            else:
-                negative += 1
-        connections = len(eligibility)
-        return {
-            "name": name,
-            "connections": connections,
-            "active": active,
-            "positive": positive,
-            "negative": negative,
-            "meanAbs": round(total_abs / max(1, connections), 6),
-            "maxAbs": round(max_abs, 6),
-        }
+            pre_scale = 1.0 if pre_scales is None else pre_scales.get(pre, 0.0)
+            if pre_scale <= 0.0:
+                continue
+            for edge_index in group.by_pre[pre]:
+                if group.post[edge_index] in active_post_set:
+                    group.add_eligibility(edge_index, plus * pre_scale)
+                    changed["increased"] += 1
+                else:
+                    group.add_eligibility(edge_index, -minus * pre_scale)
+                    changed["decreased"] += 1
+        return changed
 
-    def _eligibility_trace_stats_flat(self, name, eligibility):
-        stats = self._eligibility_stats_flat(name, self._effective_flat_eligibility(eligibility))
-        stats["traces"] = {
-            trace["name"]: self._eligibility_stats_flat(trace["name"], eligibility[trace["name"]])
-            for trace in self.eligibility_traces
-        }
-        return stats
-
-    def _eligibility_trace_stats_nested(self, name, eligibility):
-        flat = {}
-        for trace in self.eligibility_traces:
-            flat[trace["name"]] = [value for row in eligibility[trace["name"]] for value in row]
-        return self._eligibility_trace_stats_flat(name, flat)
+    def _update_prediction_eligibility(self, hidden_spikes):
+        changed = {"increased": 0, "decreased": 0}
+        for pre in hidden_spikes:
+            for edge_index in self.hidden_prediction.by_pre[pre]:
+                self.hidden_prediction.add_eligibility(edge_index, self.eligibility_plus)
+                changed["increased"] += 1
+        return changed
 
     def _summarize_eligibility(self):
         return {
-            "inputH1": self._eligibility_trace_stats_flat("inputH1", self.input_eligibility),
-            "h1H2": self._eligibility_trace_stats_nested("h1H2", self.h1_h2_eligibility),
-            "h2H3": self._eligibility_trace_stats_nested("h2H3", self.h2_h3_eligibility),
-            "h3Output": self._eligibility_trace_stats_nested("h3Output", self.h3_out_eligibility),
+            "inputH1": self.input_hidden.stats(),
+            "motorContext": self.motor_hidden.stats(),
+            "recurrentCloud": self.recurrent.stats(),
+            "predictionHead": self.hidden_prediction.stats(),
+            "h3Output": self.hidden_output.stats(),
         }
 
-    def _eligibility_input(self, active_pixels, h1_spikes):
-        h1_active = set(h1_spikes)
-        changed = {"increased": 0, "decreased": 0}
-        for pixel in active_pixels:
-            y = pixel // self.width
-            x = pixel - y * self.width
-            hx = min(self.h1_w - 1, x // self.h1_cell)
-            hy = min(self.h1_h - 1, y // self.h1_cell)
-            post = _grid_index(hx, hy, self.h1_w)
-            if post in h1_active:
-                self._add_flat_eligibility(self.input_eligibility, pixel, self.eligibility_plus)
-                changed["increased"] += 1
-            else:
-                self._add_flat_eligibility(self.input_eligibility, pixel, -self.eligibility_minus)
-                changed["decreased"] += 1
-        return changed
-
-    def _eligibility_projection(self, pre_spikes, post_spikes, projection, eligibility):
-        pre_active = set(pre_spikes)
-        post_active = set(post_spikes)
-        changed = {"increased": 0, "decreased": 0}
-        if not pre_active:
-            return changed
-        for post, pres in enumerate(projection):
-            active_post = post in post_active
-            for offset, pre in enumerate(pres):
-                if pre not in pre_active:
-                    continue
-                if active_post:
-                    self._add_nested_eligibility(eligibility, post, offset, self.eligibility_plus)
-                    changed["increased"] += 1
-                else:
-                    self._add_nested_eligibility(eligibility, post, offset, -self.eligibility_minus)
-                    changed["decreased"] += 1
-        return changed
-
-    def _eligibility_output(self, h3_spikes, winner_index):
-        active = set(h3_spikes)
-        changed = {"increased": 0, "decreased": 0}
-        if not active:
-            return changed
-        for output_index, pres in enumerate(self.h3_out_pre):
-            for offset, pre in enumerate(pres):
-                if pre not in active:
-                    continue
-                if output_index == winner_index:
-                    self._add_nested_eligibility(self.h3_out_eligibility, output_index, offset, self.eligibility_plus)
-                    changed["increased"] += 1
-                else:
-                    self._add_nested_eligibility(self.h3_out_eligibility, output_index, offset, -self.eligibility_minus)
-                    changed["decreased"] += 1
-        return changed
-
-    def _apply_flat_reward(self, weights, eligibility, reward, stats):
-        if reward == 0.0:
-            return
-        effective = self._effective_flat_eligibility(eligibility)
-        for index, trace in enumerate(effective):
-            if abs(trace) <= 0.00001:
-                continue
-            before = weights[index]
-            delta = self.learning_rate * reward * trace
-            after = _clamp(before + delta)
-            if after == before:
-                continue
-            weights[index] = after
-            stats["weightUpdates"] += 1
-            stats["meanAbsDelta"] += abs(after - before)
-            if after == 0.0 or after == 1.0:
-                stats["clamped"] += 1
-            if after > before:
-                stats["potentiated"] += 1
-            else:
-                stats["depressed"] += 1
-
-    def _apply_nested_reward(self, weights, eligibility, reward, stats):
-        for row_index, weight_row in enumerate(weights):
-            eligibility_row = {
-                trace["name"]: eligibility[trace["name"]][row_index]
-                for trace in self.eligibility_traces
-            }
-            self._apply_flat_reward(weight_row, eligibility_row, reward, stats)
-
-    def _apply_rewarded_weights(self, reward, local_changes):
+    def _apply_learning(self, reward, predictive_signal, prediction_errors, local_changes):
         stats = self._empty_learning_stats()
         stats["step"] = self.train_steps + 1
         stats["rewardApplied"] = round(reward, 5)
+        stats["predictionApplied"] = round(predictive_signal, 5)
+        combined = reward + self.predictive_modulation_scale * predictive_signal
+        stats["combinedModulator"] = round(combined, 5)
         stats["eligibilityIncreased"] = local_changes["increased"]
         stats["eligibilityDecreased"] = local_changes["decreased"]
-        self._apply_flat_reward(self.input_weights, self.input_eligibility, reward, stats)
-        self._apply_nested_reward(self.h1_h2_weights, self.h1_h2_eligibility, reward, stats)
-        self._apply_nested_reward(self.h2_h3_weights, self.h2_h3_eligibility, reward, stats)
-        self._apply_nested_reward(self.h3_out_weights, self.h3_out_eligibility, reward, stats)
+
+        self.hidden_prediction.apply_post_errors(self.prediction_learning_rate, prediction_errors, stats)
+        for group in (self.input_hidden, self.motor_hidden, self.recurrent, self.hidden_output):
+            group.apply_modulator(self.learning_rate, combined, stats)
+
         if stats["weightUpdates"] > 0:
             stats["meanAbsDelta"] = round(stats["meanAbsDelta"] / stats["weightUpdates"], 8)
         else:
@@ -699,6 +917,10 @@ class PongSNN:
         }
         return total
 
+    def _update_motor_traces(self, winner_index):
+        self.previous_action_traces = [value * self.motor_trace_decay for value in self.previous_action_traces]
+        self.previous_action_traces[winner_index] = 1.0
+
     def step(self, event_camera, tick, game_state=None):
         if not event_camera:
             return None
@@ -707,13 +929,16 @@ class PongSNN:
             pixels = []
 
         self.tick = int(tick or self.tick)
-        active_pixels, h1_drive = self._input_to_h1(pixels)
-        h1_spikes = self._spikes_from_drives(h1_drive, threshold=0.58, max_spikes=256)
-        h2_drive = self._project(h1_spikes, self.h1_h2_pre, self.h1_h2_weights)
-        h2_spikes = self._spikes_from_drives(h2_drive, threshold=0.82, max_spikes=96)
-        h3_drive = self._project(h2_spikes, self.h2_h3_pre, self.h2_h3_weights)
-        h3_spikes = self._spikes_from_drives(h3_drive, threshold=0.92, max_spikes=36)
-        output_drive, output_bars, winner_index = self._output(h3_spikes)
+        camera_width = max(1, int(event_camera.get("width", self.width) or self.width))
+        camera_height = max(1, int(event_camera.get("height", self.height) or self.height))
+        active_pixels, active_cells = self._compress_events(pixels, camera_width, camera_height)
+
+        drive = [0.0 for _ in range(self.hidden_size)]
+        self._add_group_drive(drive, self.input_hidden, active_cells)
+        self._add_motor_drive(drive)
+        self._add_group_drive(drive, self.recurrent, self.last_hidden_spikes)
+        hidden_spikes = self._hidden_spikes(drive)
+        output_drive, output_bars, winner_index = self._output(hidden_spikes)
         winner = OUTPUTS[winner_index]
 
         changed = {
@@ -725,42 +950,61 @@ class PongSNN:
         if self.training and not self.paused:
             reward = self._reward_from_pong(game_state, output_bars=output_bars, winner_index=winner_index)
             self._decay_eligibilities()
+            predictive_signal, prediction_errors = self._prediction_error(active_cells)
             local_changes = {"increased": 0, "decreased": 0}
+            motor_scales = {
+                index: trace
+                for index, trace in enumerate(self.previous_action_traces)
+                if trace > 0.005
+            }
             for update in (
-                self._eligibility_input(active_pixels, h1_spikes),
-                self._eligibility_projection(h1_spikes, h2_spikes, self.h1_h2_pre, self.h1_h2_eligibility),
-                self._eligibility_projection(h2_spikes, h3_spikes, self.h2_h3_pre, self.h2_h3_eligibility),
-                self._eligibility_output(h3_spikes, winner_index),
+                self._update_pre_post_eligibility(self.input_hidden, active_cells, hidden_spikes),
+                self._update_pre_post_eligibility(self.motor_hidden, range(self.motor_size), hidden_spikes, pre_scales=motor_scales),
+                self._update_pre_post_eligibility(self.recurrent, self.last_hidden_spikes, hidden_spikes),
+                self._update_pre_post_eligibility(self.hidden_output, hidden_spikes, (winner_index,)),
+                self._update_prediction_eligibility(hidden_spikes),
             ):
                 local_changes["increased"] += update["increased"]
                 local_changes["decreased"] += update["decreased"]
-            self.eligibility_stats = self._summarize_eligibility()
-            self.learning_stats = self._apply_rewarded_weights(reward, local_changes)
+            self.learning_stats = self._apply_learning(reward, predictive_signal, prediction_errors, local_changes)
+            if self.train_steps % self.status_summary_interval == 0:
+                self.eligibility_stats = self._summarize_eligibility()
             changed["potentiated"] = self.learning_stats["potentiated"]
             changed["depressed"] = self.learning_stats["depressed"]
             changed["eligibilityIncreased"] = local_changes["increased"]
             changed["eligibilityDecreased"] = local_changes["decreased"]
             self.train_steps += 1
+        else:
+            self._prediction_error(active_cells)
 
+        prediction = self._predict_next(hidden_spikes)
+        self.last_prediction = prediction
         direction = int(winner["direction"])
+        self._update_motor_traces(winner_index)
+        self.last_hidden_spikes = hidden_spikes
+
+        hidden_sample = hidden_spikes[:900]
         self.activity = {
             "tick": self.tick,
             "eventCount": len(active_pixels),
+            "compressedEventCount": len(active_cells),
             "spikes": {
-                "input": len(active_pixels),
-                "hidden1": len(h1_spikes),
-                "hidden2": len(h2_spikes),
-                "hidden3": len(h3_spikes),
-                "output": 1 if max(output_drive, default=0.0) > 0.0 else 0,
+                "input": len(active_cells),
+                "hidden1": len(hidden_spikes),
+                "hidden2": len(self.last_hidden_spikes),
+                "hidden3": self.last_prediction_edges,
+                "output": 1 if hidden_spikes else 0,
             },
             "outputDrive": [round(value, 4) for value in output_drive],
             "outputBars": [round(value, 4) for value in output_bars],
             "winner": winner["name"],
             "direction": direction,
-            "activeInputSample": active_pixels[:900],
-            "activeHidden1": h1_spikes[:256],
-            "activeHidden2": h2_spikes[:192],
-            "activeHidden3": h3_spikes[:128],
+            "activeInputSample": active_cells[:900],
+            "activeHidden1": hidden_sample,
+            "activeHidden2": hidden_sample[:320],
+            "activeHidden3": sorted(prediction, key=prediction.get, reverse=True)[:256],
+            "motorTraces": [round(value, 4) for value in self.previous_action_traces],
+            "prediction": self.prediction_state,
             "stdp": changed,
             "reward": self.reward_state,
             "eligibility": self.eligibility_stats,
@@ -787,6 +1031,7 @@ class PongSNN:
             "architecture": self.architecture(),
             "activity": self.activity,
             "reward": self.reward_state,
+            "prediction": self.prediction_state,
             "eligibility": self.eligibility_stats,
             "learning": self.learning_stats,
             "outputs": OUTPUTS,
@@ -811,27 +1056,59 @@ class PongSNN:
             "height": self.height,
             "seed": self.seed,
             "trainSteps": self.train_steps,
-            "inputWeights": self.input_weights,
-            "h1h2Weights": self.h1_h2_weights,
-            "h2h3Weights": self.h2_h3_weights,
-            "h3outWeights": self.h3_out_weights,
+            "inputGrid": {"width": self.input_w, "height": self.input_h},
+            "hidden": {
+                "size": self.hidden_size,
+                "width": self.hidden_w,
+                "height": self.hidden_h,
+            },
+            "previousActionTraces": self.previous_action_traces,
+            "groups": {
+                "inputHidden": self.input_hidden.to_dict(),
+                "motorHidden": self.motor_hidden.to_dict(),
+                "recurrentCloud": self.recurrent.to_dict(),
+                "hiddenOutput": self.hidden_output.to_dict(),
+                "predictionHead": self.hidden_prediction.to_dict(),
+            },
             "savedAt": time.time(),
         }
 
     def load_dict(self, payload):
+        if int(payload.get("version", 0)) != self.version:
+            raise ValueError("saved network version does not match the recurrent predictive backend")
         if int(payload.get("width", self.width)) != self.width or int(payload.get("height", self.height)) != self.height:
             raise ValueError("saved network dimensions do not match this Pong event camera")
+        hidden = payload.get("hidden", {})
+        grid = payload.get("inputGrid", {})
+        if int(hidden.get("size", self.hidden_size)) != self.hidden_size:
+            raise ValueError("saved hidden cloud size does not match this backend")
+        if int(grid.get("width", self.input_w)) != self.input_w or int(grid.get("height", self.input_h)) != self.input_h:
+            raise ValueError("saved input grid does not match this backend")
+
         self.seed = int(payload.get("seed", self.seed))
         self.train_steps = int(payload.get("trainSteps", 0))
-        self.input_weights = [float(value) for value in payload["inputWeights"]]
-        self.h1_h2_weights = [[float(value) for value in row] for row in payload["h1h2Weights"]]
-        self.h2_h3_weights = [[float(value) for value in row] for row in payload["h2h3Weights"]]
-        self.h3_out_weights = [[float(value) for value in row] for row in payload["h3outWeights"]]
+        traces = payload.get("previousActionTraces", self.previous_action_traces)
+        self.previous_action_traces = [float(value) for value in traces[: self.motor_size]]
+        while len(self.previous_action_traces) < self.motor_size:
+            self.previous_action_traces.append(0.0)
+
+        groups = payload.get("groups", {})
+        self.input_hidden.load_weights(groups["inputHidden"])
+        self.motor_hidden.load_weights(groups["motorHidden"])
+        self.recurrent.load_weights(groups["recurrentCloud"])
+        self.hidden_output.load_weights(groups["hiddenOutput"])
+        self.hidden_prediction.load_weights(groups["predictionHead"])
+
+        self.last_hidden_spikes = []
+        self.last_prediction = {}
         self.last_pong_snapshot = None
         self.reward_function.reset()
         self.recent_right_scores = 0
         self.recent_opponent_scores = 0
         self.reward_state = self._empty_reward_state()
+        self.prediction_state = self._empty_prediction_state()
+        self.eligibility_stats = self._empty_eligibility_stats()
+        self.learning_stats = self._empty_learning_stats()
         self.activity = self._empty_activity()
 
     def save(self, name=None):

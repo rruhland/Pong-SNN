@@ -80,21 +80,27 @@ game's controls.
 
 ## Backend SNN
 
-The SNN logic is still the sparse event-camera network:
+The SNN backend now uses a compressed, recurrent predictive architecture:
 
-- Input: `800 x 450` event-camera pixels.
-- Hidden layer 1: `80 x 45`, one sparse chunk neuron per `10 x 10` pixel area.
-- Hidden layer 2: `40 x 23`, sparse `3 x 3` neighborhoods over hidden layer 1.
-- Hidden layer 3: `20 x 12`, sparse `5 x 5` neighborhoods over hidden layer 2.
-- Output: `move up`, `move down`, `stay put`.
+- Input: the `800 x 450` event-camera pixels are compressed into a `64 x 36`
+  event grid, with one input neuron per changed cell.
+- Motor context: the previous `move up`, `move down`, and `stay put` actions are
+  fed back as three decaying traces.
+- Hidden cloud: about `5,000` recurrent neurons, with roughly `80%` excitatory
+  and `20%` inhibitory cells. Initial recurrent connectivity is sparse and
+  distance-biased, with stronger nearby edges and weaker long-range edges.
+- Outputs: a three-neuron motor readout for `move up`, `move down`, and
+  `stay put`, plus a prediction head that predicts the next `64 x 36` event
+  grid.
 
-Training uses reward-modulated STDP eligibility traces. Active pre plus active
-post increases each synapse group's fast, medium, and slow eligibility traces;
-active pre without post decreases them slightly. The traces decay independently
-at roughly 500 ms, 2 s, and 5 s scales, then combine as
-`fast + 0.35 * medium + 0.08 * slow`. Pong reward gates weights with
-`weight += learning_rate * reward * effective_eligibility`, clamped to the
-network's existing weight range.
+Training uses STDP eligibility traces modulated by both Pong reward and
+self-supervised prediction error. Active pre plus active post increases each
+synapse group's fast, medium, and slow eligibility traces; active pre without
+post decreases them slightly. The traces decay independently at roughly 500 ms,
+2 s, and 5 s scales, then combine as
+`fast + 0.35 * medium + 0.08 * slow`. Pong reward gates action and recurrent
+weights, while next-frame event prediction error updates eligible prediction
+head edges and contributes a smaller modulatory signal to the recurrent cloud.
 
 Reward is assembled from named, tunable components in `RewardFunction`, but the
 signal is intentionally sparse and game-level. Up/down movement receives a small
