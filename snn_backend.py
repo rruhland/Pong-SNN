@@ -193,10 +193,12 @@ class SynapseGroup:
     def effective_values(self):
         return [self.effective(index) for index in self.active_edges]
 
-    def apply_modulator(self, learning_rate, modulator, stats):
+    def apply_modulator(self, learning_rate, modulator, stats, update_key=None, edge_filter=None):
         if modulator == 0.0:
             return
         for index in list(self.active_edges):
+            if edge_filter is not None and not edge_filter(index):
+                continue
             before = self.weight[index]
             trace = self.effective(index)
             if abs(trace) <= 0.00001:
@@ -207,6 +209,8 @@ class SynapseGroup:
                 continue
             self.weight[index] = after
             stats["weightUpdates"] += 1
+            if update_key:
+                stats[update_key] += 1
             stats["meanAbsDelta"] += abs(after - before)
             if after == self.low[index] or after == self.high[index]:
                 stats["clamped"] += 1
@@ -316,7 +320,7 @@ class SynapseGroup:
 class PongSNN:
     """Compressed event-camera SNN with a recurrent predictive hidden cloud."""
 
-    version = 2
+    version = 3
 
     def __init__(self, width=800, height=450, seed=None, save_dir=None):
         self.width = int(width)
@@ -346,8 +350,14 @@ class PongSNN:
 
         self.learning_rate = 0.0045
         self.prediction_learning_rate = 0.018
-        self.predictive_modulation_scale = 0.18
+        self.prediction_pathway_learning_rate = 0.0028
+        self.reward_recurrent_learning_rate = 0.0012
         self.status_summary_interval = 10
+        self.input_hidden_targets_per_cell = 24
+        self.output_targets_per_hidden = 1
+        self.prediction_local_targets = 20
+        self.prediction_medium_targets = 4
+        self.prediction_long_targets = 2
         self.eligibility_plus = 0.14
         self.eligibility_minus = 0.03
         self.eligibility_traces = tuple(dict(trace) for trace in ELIGIBILITY_TRACES)
@@ -382,6 +392,7 @@ class PongSNN:
             self._build_motor_hidden_edges(),
             self.eligibility_traces,
         )
+        self.motor_context_neurons = set(self.motor_hidden.post)
         self.recurrent = SynapseGroup(
             "recurrentCloud",
             self.hidden_size,
@@ -448,14 +459,20 @@ class PongSNN:
 
     def _build_input_hidden_edges(self):
         edges = []
-        offsets = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
         for pre in range(self.input_size):
             cx, cy = self._input_to_hidden_center(pre)
-            for dx, dy in offsets:
-                hx = max(0, min(self.hidden_w - 1, cx + dx))
-                hy = max(0, min(self.hidden_h - 1, cy + dy))
-                post = self._hidden_index(hx, hy)
-                weight = 0.34 + self.rng.random() * 0.38
+            posts = set()
+            attempts = 0
+            while len(posts) < self.input_hidden_targets_per_cell and attempts < self.input_hidden_targets_per_cell * 8:
+                attempts += 1
+                hx = int(round(self.rng.gauss(cx, 3.4)))
+                hy = int(round(self.rng.gauss(cy, 2.4)))
+                hx = max(0, min(self.hidden_w - 1, hx))
+                hy = max(0, min(self.hidden_h - 1, hy))
+                posts.add(self._hidden_index(hx, hy))
+            posts.add(self._hidden_index(cx, cy))
+            for post in sorted(posts):
+                weight = 0.30 + self.rng.random() * 0.32
                 edges.append((pre, post, weight, 0.0, 1.0))
         return edges
 
@@ -501,33 +518,44 @@ class PongSNN:
             _, hy = self._hidden_xy(pre)
             vertical = hy / max(1, self.hidden_h - 1)
             low, high = self._signed_bounds(pre)
-            for post, output in enumerate(OUTPUTS):
-                if output["direction"] == -1:
-                    bias = 0.055 * (1.0 - vertical)
-                elif output["direction"] == 1:
-                    bias = 0.055 * vertical
-                else:
-                    bias = 0.03
-                magnitude = 0.01 + self.rng.random() * 0.08 + bias
-                weight = magnitude if self.neuron_is_excitatory[pre] else -magnitude
-                edges.append((pre, post, weight, low, high))
+            action_scores = [
+                0.62 * (1.0 - vertical) + self.rng.random() * 0.22,
+                0.62 * vertical + self.rng.random() * 0.22,
+                0.36 - abs(vertical - 0.5) * 0.22 + self.rng.random() * 0.24,
+            ]
+            preferred = max(range(self.motor_size), key=lambda index: action_scores[index])
+            magnitude = 0.055 + self.rng.random() * 0.11
+            weight = magnitude if self.neuron_is_excitatory[pre] else -magnitude
+            edges.append((pre, preferred, weight, low, high))
         return edges
 
     def _build_prediction_edges(self):
         edges = []
-        offsets = ((0, 0), (-1, 0), (1, 0), (0, -1))
         for pre in range(self.hidden_size):
             hx, hy = self._hidden_xy(pre)
             gx = int((hx + 0.5) * self.input_w / self.hidden_w)
             gy = int((hy + 0.5) * self.input_h / self.hidden_h)
             low, high = self._signed_bounds(pre)
-            for dx, dy in offsets:
-                px = max(0, min(self.input_w - 1, gx + dx))
-                py = max(0, min(self.input_h - 1, gy + dy))
-                post = _grid_index(px, py, self.input_w)
-                weight = self._signed_weight(pre, 0.04, 0.22)
+            posts = set()
+            self._add_prediction_targets(posts, gx, gy, self.prediction_local_targets, sigma_x=2.2, sigma_y=1.8)
+            self._add_prediction_targets(posts, gx, gy, self.prediction_medium_targets, sigma_x=7.0, sigma_y=4.4)
+            while len(posts) < self.prediction_local_targets + self.prediction_medium_targets + self.prediction_long_targets:
+                posts.add(self.rng.randrange(self.input_size))
+            for post in sorted(posts):
+                weight = self._signed_weight(pre, 0.025, 0.18)
                 edges.append((pre, post, weight, low, high))
         return edges
+
+    def _add_prediction_targets(self, posts, cx, cy, count, sigma_x, sigma_y):
+        attempts = 0
+        target_size = len(posts) + count
+        while len(posts) < target_size and attempts < count * 10:
+            attempts += 1
+            px = int(round(self.rng.gauss(cx, sigma_x)))
+            py = int(round(self.rng.gauss(cy, sigma_y)))
+            px = max(0, min(self.input_w - 1, px))
+            py = max(0, min(self.input_h - 1, py))
+            posts.add(_grid_index(px, py, self.input_w))
 
     def _empty_activity(self):
         return {
@@ -591,10 +619,13 @@ class PongSNN:
             "step": self.train_steps,
             "learningRate": self.learning_rate,
             "predictionLearningRate": self.prediction_learning_rate,
+            "predictionPathwayLearningRate": self.prediction_pathway_learning_rate,
+            "rewardRecurrentLearningRate": self.reward_recurrent_learning_rate,
             "rewardApplied": 0.0,
             "predictionApplied": 0.0,
             "combinedModulator": 0.0,
             "weightUpdates": 0,
+            "rewardWeightUpdates": 0,
             "predictionWeightUpdates": 0,
             "potentiated": 0,
             "depressed": 0,
@@ -623,6 +654,7 @@ class PongSNN:
                 "height": self.input_h,
                 "neurons": self.input_size,
                 "activeRule": "any event-camera pixel in a 64x36 cell spikes that cell",
+                "hiddenFanoutPerCell": self.input_hidden_targets_per_cell,
             },
             "motorContext": {
                 "neurons": self.motor_size,
@@ -648,7 +680,7 @@ class PongSNN:
                     "width": self.input_w,
                     "height": self.input_h,
                     "neurons": self.input_size,
-                    "receptiveField": "local hidden-cloud readout",
+                    "receptiveField": "mostly local hidden-cloud readout with medium and long-range prediction edges",
                     "connections": len(self.hidden_prediction),
                 },
                 {
@@ -657,7 +689,7 @@ class PongSNN:
                     "width": 3,
                     "height": 1,
                     "neurons": 3,
-                    "receptiveField": "hidden-cloud readout",
+                    "receptiveField": "sparse preferred-action hidden-cloud readout",
                     "connections": len(self.hidden_output),
                     "labels": [item["name"] for item in OUTPUTS],
                 },
@@ -674,12 +706,14 @@ class PongSNN:
                 "mode": "reward and prediction-error modulated eligibility traces",
                 "learningRate": self.learning_rate,
                 "predictionLearningRate": self.prediction_learning_rate,
+                "predictionPathwayLearningRate": self.prediction_pathway_learning_rate,
+                "rewardRecurrentLearningRate": self.reward_recurrent_learning_rate,
                 "eligibilityDecay": self.eligibility_decay,
                 "eligibilityTraces": self._eligibility_trace_config(),
                 "effectiveEligibility": "fast + 0.35 * medium + 0.08 * slow",
                 "eligibilityPlus": self.eligibility_plus,
                 "eligibilityMinus": self.eligibility_minus,
-                "rule": "local pre/post coactivity updates eligibility; reward and predictive error gate weight changes",
+                "rule": "prediction error trains visual/recurrent/prediction pathways; reward trains motor-context/output pathways plus a small motor-adjacent recurrent subset",
                 "rewardComponents": self.reward_function.config(),
             },
         }
@@ -726,9 +760,6 @@ class PongSNN:
             self.hidden_potential[index] = value
             if value >= 0.42:
                 candidates.append((index, value))
-        if not candidates:
-            strongest = sorted(((index, value) for index, value in enumerate(drive) if value > 0.0), key=lambda item: item[1], reverse=True)
-            candidates = strongest[:16]
         if len(candidates) > 220:
             candidates = sorted(candidates, key=lambda item: item[1], reverse=True)[:220]
         spikes = [index for index, _ in candidates]
@@ -862,14 +893,45 @@ class PongSNN:
         stats["step"] = self.train_steps + 1
         stats["rewardApplied"] = round(reward, 5)
         stats["predictionApplied"] = round(predictive_signal, 5)
-        combined = reward + self.predictive_modulation_scale * predictive_signal
-        stats["combinedModulator"] = round(combined, 5)
+        stats["combinedModulator"] = 0.0
         stats["eligibilityIncreased"] = local_changes["increased"]
         stats["eligibilityDecreased"] = local_changes["decreased"]
 
         self.hidden_prediction.apply_post_errors(self.prediction_learning_rate, prediction_errors, stats)
-        for group in (self.input_hidden, self.motor_hidden, self.recurrent, self.hidden_output):
-            group.apply_modulator(self.learning_rate, combined, stats)
+        self.input_hidden.apply_modulator(
+            self.prediction_pathway_learning_rate,
+            predictive_signal,
+            stats,
+            update_key="predictionWeightUpdates",
+        )
+        self.recurrent.apply_modulator(
+            self.prediction_pathway_learning_rate,
+            predictive_signal,
+            stats,
+            update_key="predictionWeightUpdates",
+        )
+        self.motor_hidden.apply_modulator(
+            self.learning_rate,
+            reward,
+            stats,
+            update_key="rewardWeightUpdates",
+        )
+        self.hidden_output.apply_modulator(
+            self.learning_rate,
+            reward,
+            stats,
+            update_key="rewardWeightUpdates",
+        )
+        self.recurrent.apply_modulator(
+            self.reward_recurrent_learning_rate,
+            reward,
+            stats,
+            update_key="rewardWeightUpdates",
+            edge_filter=lambda index: (
+                self.recurrent.pre[index] in self.motor_context_neurons
+                or self.recurrent.post[index] in self.motor_context_neurons
+            ),
+        )
 
         if stats["weightUpdates"] > 0:
             stats["meanAbsDelta"] = round(stats["meanAbsDelta"] / stats["weightUpdates"], 8)
