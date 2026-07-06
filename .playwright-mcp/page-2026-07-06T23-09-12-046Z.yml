@@ -1,0 +1,59 @@
+- main [ref=e2]:
+  - complementary [ref=e3]:
+    - generic "SNN output activity" [ref=e4]:
+      - generic [ref=e6]: Up
+      - generic [ref=e9]: Down
+      - generic [ref=e12]: Nothing
+    - generic [ref=e14]:
+      - button "start" [active] [ref=e15] [cursor=pointer]
+      - button "pause" [ref=e16] [cursor=pointer]
+    - button "reset" [ref=e17] [cursor=pointer]
+    - generic [ref=e18]:
+      - button "save-network" [ref=e19] [cursor=pointer]
+      - button "load-network" [ref=e20] [cursor=pointer]
+    - combobox "Saved networks" [ref=e21] [cursor=pointer]:
+      - option "select saved network" [selected]
+      - option "hidden_cloud_100k_steps.json"
+      - option "hidden-cloud-5k_steps.json"
+      - option "sped-up-400k_steps.json"
+      - option "sped-up-230k_steps.json"
+      - option "ran-overnight.json"
+      - option "pong-snn-1781844532.json"
+      - option "pong-snn-1781783486.json"
+      - option "pong-snn-1781740298.json"
+      - option "1million_steps.json"
+      - option "1dot8million_steps.json"
+    - generic [ref=e22]:
+      - generic [ref=e23]: trail
+      - slider "trail" [ref=e24]: "120"
+      - status [ref=e25]: 120ms
+    - generic [ref=e26]:
+      - generic [ref=e27]: speed
+      - slider "speed" [ref=e28]: "1"
+      - status [ref=e29]: 1.00x
+    - generic [ref=e30]:
+      - generic [ref=e31]: "backend: cpu (cuda unavailable)"
+      - generic [ref=e32]: training
+    - generic "Stream status" [ref=e33]:
+      - generic [ref=e34]: "world: game-channel frame 862"
+      - generic [ref=e35]: "events: 145 changes frame 862"
+      - generic [ref=e36]: "snn: 1491 samples through frame 848"
+      - generic [ref=e37]: "action: hold seq 8"
+  - generic [ref=e38]:
+    - heading "Pong Screen" [level=1] [ref=e39]
+    - generic "Pong state preview" [ref=e40]
+  - region "SNN status" [ref=e41]:
+    - generic [ref=e42]:
+      - generic [ref=e43]: "Score:"
+      - generic [ref=e44]: 0:0
+    - generic [ref=e45]: stay put
+    - generic [ref=e46]:
+      - generic [ref=e47]: events 134
+      - generic [ref=e48]: spikes 220 / 220 / 5720
+      - generic [ref=e49]: stdp +12787 / -24727
+      - generic [ref=e50]: reward +0.012
+      - generic [ref=e51]: eligibility 33445 traces / max 1.430
+      - generic [ref=e52]: scores 0 / opp 0
+      - generic [ref=e53]: learn step 13 / updates 37514
+  - region "Network design" [ref=e54]:
+    - generic "Sparse SNN architecture and activity" [ref=e55]

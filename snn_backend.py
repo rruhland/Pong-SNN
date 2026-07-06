@@ -25,9 +25,57 @@ ELIGIBILITY_TRACES = (
     {"name": "slow", "decay": 0.99, "scale": 0.08, "horizonMs": 5000},
 )
 
+# Edit these values to change the backend architecture shape without touching the
+# builder logic. Defaults mirror the pre-config version of the recurrent SNN.
+SNN_ARCHITECTURE = {
+    "input_grid_width": 64,
+    "input_grid_height": 36,
+    "hidden_neurons": 500,
+    "hidden_grid_width": 100,
+    "hidden_grid_height": None,
+    "excitatory_fraction": 0.8,
+    "input_hidden_targets_per_cell": 24,
+    "input_hidden_sigma_x": 3.4,
+    "input_hidden_sigma_y": 2.4,
+    "input_hidden_attempt_multiplier": 8,
+    "motor_hidden_targets_per_action": 420,
+    "motor_hidden_sigma_y_fraction": 0.18,
+    "recurrent_local_edges_per_neuron": 18,
+    "recurrent_long_range_edges_per_neuron": 6,
+    "recurrent_local_sigma_x": 3.2,
+    "recurrent_local_sigma_y": 2.1,
+    "output_targets_per_hidden": 1,
+    "prediction_local_targets": 20,
+    "prediction_medium_targets": 4,
+    "prediction_long_targets": 2,
+    "prediction_local_sigma_x": 2.2,
+    "prediction_local_sigma_y": 1.8,
+    "prediction_medium_sigma_x": 7.0,
+    "prediction_medium_sigma_y": 4.4,
+}
+
 
 def _clamp(value, low=0.0, high=1.0):
     return max(low, min(high, value))
+
+
+def _architecture_config(overrides=None):
+    config = dict(SNN_ARCHITECTURE)
+    if overrides:
+        config.update(overrides)
+    return config
+
+
+def _positive_int(config, key, minimum=1):
+    return max(minimum, int(config[key]))
+
+
+def _non_negative_int(config, key):
+    return max(0, int(config[key]))
+
+
+def _positive_float(config, key):
+    return max(0.000001, float(config[key]))
 
 
 def _grid_index(x, y, width):
@@ -322,7 +370,7 @@ class PongSNN:
 
     version = 3
 
-    def __init__(self, width=800, height=450, seed=None, save_dir=None):
+    def __init__(self, width=800, height=450, seed=None, save_dir=None, architecture=None):
         self.width = int(width)
         self.height = int(height)
         self.seed = int(seed if seed is not None else time.time() * 1000) & 0xFFFFFFFF
@@ -338,14 +386,22 @@ class PongSNN:
         self.loaded_from = None
         self.device = self._detect_device()
 
-        self.input_w = 64
-        self.input_h = 36
+        self.architecture_config = _architecture_config(architecture)
+        self.input_w = _positive_int(self.architecture_config, "input_grid_width")
+        self.input_h = _positive_int(self.architecture_config, "input_grid_height")
         self.input_size = self.input_w * self.input_h
         self.motor_size = len(OUTPUTS)
-        self.hidden_size = 5000
-        self.hidden_w = 100
-        self.hidden_h = 50
-        self.excitatory_count = int(self.hidden_size * 0.8)
+        self.hidden_size = _positive_int(self.architecture_config, "hidden_neurons")
+        self.hidden_w = _positive_int(self.architecture_config, "hidden_grid_width")
+        hidden_grid_height = self.architecture_config.get("hidden_grid_height")
+        if hidden_grid_height is None:
+            self.hidden_h = max(1, math.ceil(self.hidden_size / self.hidden_w))
+        else:
+            self.hidden_h = _positive_int(self.architecture_config, "hidden_grid_height")
+        if self.hidden_w * self.hidden_h < self.hidden_size:
+            raise ValueError("hidden_grid_width * hidden_grid_height must cover hidden_neurons")
+        excitatory_fraction = _clamp(float(self.architecture_config["excitatory_fraction"]))
+        self.excitatory_count = int(self.hidden_size * excitatory_fraction)
         self.inhibitory_count = self.hidden_size - self.excitatory_count
 
         self.learning_rate = 0.0045
@@ -353,11 +409,24 @@ class PongSNN:
         self.prediction_pathway_learning_rate = 0.0028
         self.reward_recurrent_learning_rate = 0.0012
         self.status_summary_interval = 10
-        self.input_hidden_targets_per_cell = 24
-        self.output_targets_per_hidden = 1
-        self.prediction_local_targets = 20
-        self.prediction_medium_targets = 4
-        self.prediction_long_targets = 2
+        self.input_hidden_targets_per_cell = _positive_int(self.architecture_config, "input_hidden_targets_per_cell")
+        self.input_hidden_sigma_x = _positive_float(self.architecture_config, "input_hidden_sigma_x")
+        self.input_hidden_sigma_y = _positive_float(self.architecture_config, "input_hidden_sigma_y")
+        self.input_hidden_attempt_multiplier = _positive_int(self.architecture_config, "input_hidden_attempt_multiplier")
+        self.motor_hidden_targets_per_action = _non_negative_int(self.architecture_config, "motor_hidden_targets_per_action")
+        self.motor_hidden_sigma_y_fraction = _positive_float(self.architecture_config, "motor_hidden_sigma_y_fraction")
+        self.recurrent_local_edges_per_neuron = _non_negative_int(self.architecture_config, "recurrent_local_edges_per_neuron")
+        self.recurrent_long_range_edges_per_neuron = _non_negative_int(self.architecture_config, "recurrent_long_range_edges_per_neuron")
+        self.recurrent_local_sigma_x = _positive_float(self.architecture_config, "recurrent_local_sigma_x")
+        self.recurrent_local_sigma_y = _positive_float(self.architecture_config, "recurrent_local_sigma_y")
+        self.output_targets_per_hidden = _positive_int(self.architecture_config, "output_targets_per_hidden")
+        self.prediction_local_targets = _non_negative_int(self.architecture_config, "prediction_local_targets")
+        self.prediction_medium_targets = _non_negative_int(self.architecture_config, "prediction_medium_targets")
+        self.prediction_long_targets = _non_negative_int(self.architecture_config, "prediction_long_targets")
+        self.prediction_local_sigma_x = _positive_float(self.architecture_config, "prediction_local_sigma_x")
+        self.prediction_local_sigma_y = _positive_float(self.architecture_config, "prediction_local_sigma_y")
+        self.prediction_medium_sigma_x = _positive_float(self.architecture_config, "prediction_medium_sigma_x")
+        self.prediction_medium_sigma_y = _positive_float(self.architecture_config, "prediction_medium_sigma_y")
         self.eligibility_plus = 0.14
         self.eligibility_minus = 0.03
         self.eligibility_traces = tuple(dict(trace) for trace in ELIGIBILITY_TRACES)
@@ -441,7 +510,7 @@ class PongSNN:
         return index % self.hidden_w, index // self.hidden_w
 
     def _hidden_index(self, x, y):
-        return _grid_index(x % self.hidden_w, y % self.hidden_h, self.hidden_w)
+        return _grid_index(x % self.hidden_w, y % self.hidden_h, self.hidden_w) % self.hidden_size
 
     def _input_to_hidden_center(self, input_index):
         x = input_index % self.input_w
@@ -463,10 +532,11 @@ class PongSNN:
             cx, cy = self._input_to_hidden_center(pre)
             posts = set()
             attempts = 0
-            while len(posts) < self.input_hidden_targets_per_cell and attempts < self.input_hidden_targets_per_cell * 8:
+            max_attempts = self.input_hidden_targets_per_cell * self.input_hidden_attempt_multiplier
+            while len(posts) < self.input_hidden_targets_per_cell and attempts < max_attempts:
                 attempts += 1
-                hx = int(round(self.rng.gauss(cx, 3.4)))
-                hy = int(round(self.rng.gauss(cy, 2.4)))
+                hx = int(round(self.rng.gauss(cx, self.input_hidden_sigma_x)))
+                hy = int(round(self.rng.gauss(cy, self.input_hidden_sigma_y)))
                 hx = max(0, min(self.hidden_w - 1, hx))
                 hy = max(0, min(self.hidden_h - 1, hy))
                 posts.add(self._hidden_index(hx, hy))
@@ -478,12 +548,12 @@ class PongSNN:
 
     def _build_motor_hidden_edges(self):
         edges = []
-        per_action = 420
         for pre in range(self.motor_size):
             target_y = (pre + 0.5) * self.hidden_h / self.motor_size
-            for _ in range(per_action):
+            for _ in range(self.motor_hidden_targets_per_action):
                 hx = self.rng.randrange(self.hidden_w)
-                hy = int(max(0, min(self.hidden_h - 1, self.rng.gauss(target_y, self.hidden_h * 0.18))))
+                sigma_y = self.hidden_h * self.motor_hidden_sigma_y_fraction
+                hy = int(max(0, min(self.hidden_h - 1, self.rng.gauss(target_y, sigma_y))))
                 post = self._hidden_index(hx, hy)
                 weight = 0.08 + self.rng.random() * 0.26
                 edges.append((pre, post, weight, 0.0, 1.0))
@@ -491,20 +561,18 @@ class PongSNN:
 
     def _build_recurrent_edges(self):
         edges = []
-        nearby = 18
-        long_range = 6
         for pre in range(self.hidden_size):
             px, py = self._hidden_xy(pre)
             low, high = self._signed_bounds(pre)
-            for _ in range(nearby):
-                dx = int(round(self.rng.gauss(0, 3.2)))
-                dy = int(round(self.rng.gauss(0, 2.1)))
+            for _ in range(self.recurrent_local_edges_per_neuron):
+                dx = int(round(self.rng.gauss(0, self.recurrent_local_sigma_x)))
+                dy = int(round(self.rng.gauss(0, self.recurrent_local_sigma_y)))
                 post = self._hidden_index(px + dx, py + dy)
                 if post == pre:
                     post = self._hidden_index(px + 1, py)
                 weight = self._signed_weight(pre, 0.22, 0.72)
                 edges.append((pre, post, weight, low, high))
-            for _ in range(long_range):
+            for _ in range(self.recurrent_long_range_edges_per_neuron):
                 post = self.rng.randrange(self.hidden_size)
                 if post == pre:
                     post = (post + 1) % self.hidden_size
@@ -523,10 +591,16 @@ class PongSNN:
                 0.62 * vertical + self.rng.random() * 0.22,
                 0.36 - abs(vertical - 0.5) * 0.22 + self.rng.random() * 0.24,
             ]
-            preferred = max(range(self.motor_size), key=lambda index: action_scores[index])
-            magnitude = 0.055 + self.rng.random() * 0.11
-            weight = magnitude if self.neuron_is_excitatory[pre] else -magnitude
-            edges.append((pre, preferred, weight, low, high))
+            if self.output_targets_per_hidden == 1:
+                targets = [max(range(self.motor_size), key=lambda index: action_scores[index])]
+            else:
+                targets = sorted(range(self.motor_size), key=lambda index: action_scores[index], reverse=True)[
+                    : min(self.motor_size, self.output_targets_per_hidden)
+                ]
+            for target in targets:
+                magnitude = 0.055 + self.rng.random() * 0.11
+                weight = magnitude if self.neuron_is_excitatory[pre] else -magnitude
+                edges.append((pre, target, weight, low, high))
         return edges
 
     def _build_prediction_edges(self):
@@ -537,8 +611,22 @@ class PongSNN:
             gy = int((hy + 0.5) * self.input_h / self.hidden_h)
             low, high = self._signed_bounds(pre)
             posts = set()
-            self._add_prediction_targets(posts, gx, gy, self.prediction_local_targets, sigma_x=2.2, sigma_y=1.8)
-            self._add_prediction_targets(posts, gx, gy, self.prediction_medium_targets, sigma_x=7.0, sigma_y=4.4)
+            self._add_prediction_targets(
+                posts,
+                gx,
+                gy,
+                self.prediction_local_targets,
+                sigma_x=self.prediction_local_sigma_x,
+                sigma_y=self.prediction_local_sigma_y,
+            )
+            self._add_prediction_targets(
+                posts,
+                gx,
+                gy,
+                self.prediction_medium_targets,
+                sigma_x=self.prediction_medium_sigma_x,
+                sigma_y=self.prediction_medium_sigma_y,
+            )
             while len(posts) < self.prediction_local_targets + self.prediction_medium_targets + self.prediction_long_targets:
                 posts.add(self.rng.randrange(self.input_size))
             for post in sorted(posts):
@@ -716,6 +804,7 @@ class PongSNN:
                 "rule": "prediction error trains visual/recurrent/prediction pathways; reward trains motor-context/output pathways plus a small motor-adjacent recurrent subset",
                 "rewardComponents": self.reward_function.config(),
             },
+            "config": dict(self.architecture_config),
         }
 
     def _eligibility_trace_config(self):
@@ -1109,7 +1198,8 @@ class PongSNN:
     def reset(self, reset_weights=True):
         seed = self.seed if not reset_weights else int(time.time() * 1000) & 0xFFFFFFFF
         save_dir = self.save_dir
-        self.__init__(self.width, self.height, seed=seed, save_dir=save_dir)
+        architecture = dict(self.architecture_config)
+        self.__init__(self.width, self.height, seed=seed, save_dir=save_dir, architecture=architecture)
 
     def to_dict(self):
         return {
@@ -1124,6 +1214,7 @@ class PongSNN:
                 "width": self.hidden_w,
                 "height": self.hidden_h,
             },
+            "architectureConfig": dict(self.architecture_config),
             "previousActionTraces": self.previous_action_traces,
             "groups": {
                 "inputHidden": self.input_hidden.to_dict(),

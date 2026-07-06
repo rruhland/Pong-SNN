@@ -61,8 +61,60 @@ def test_score_events_dominate_dense_rewards_and_reset_episode_timer():
     assert opponent_value < -1.0
 
 
+def test_default_architecture_config_preserves_existing_shape():
+    model = PongSNN(seed=10)
+
+    assert model.hidden_size == 5000
+    assert model.hidden_w == 100
+    assert model.hidden_h == 50
+    assert model.excitatory_count == 4000
+    assert model.inhibitory_count == 1000
+    assert len(model.motor_hidden) == 3 * 420
+    assert len(model.recurrent) == 5000 * (18 + 6)
+    assert len(model.hidden_output) == 5000
+    assert len(model.hidden_prediction) == 5000 * (20 + 4 + 2)
+
+
+def test_custom_architecture_config_controls_hidden_cloud_and_edges():
+    model = PongSNN(
+        seed=11,
+        architecture={
+            "input_grid_width": 16,
+            "input_grid_height": 9,
+            "hidden_neurons": 120,
+            "hidden_grid_width": 12,
+            "hidden_grid_height": 10,
+            "excitatory_fraction": 0.25,
+            "motor_hidden_targets_per_action": 7,
+            "recurrent_local_edges_per_neuron": 3,
+            "recurrent_long_range_edges_per_neuron": 2,
+            "output_targets_per_hidden": 2,
+            "prediction_local_targets": 4,
+            "prediction_medium_targets": 2,
+            "prediction_long_targets": 1,
+        },
+    )
+
+    assert model.input_size == 16 * 9
+    assert model.hidden_size == 120
+    assert model.hidden_w == 12
+    assert model.hidden_h == 10
+    assert model.excitatory_count == 30
+    assert model.inhibitory_count == 90
+    assert len(model.motor_hidden) == 3 * 7
+    assert len(model.recurrent) == 120 * (3 + 2)
+    assert len(model.hidden_output) == 120 * 2
+    assert len(model.hidden_prediction) == 120 * (4 + 2 + 1)
+
+    model.reset(reset_weights=False)
+    assert model.hidden_size == 120
+    assert len(model.recurrent) == 120 * (3 + 2)
+
+
 if __name__ == "__main__":
     test_movement_costs_reward_and_hold_is_neutral_before_survival()
     test_survival_grows_slowly_with_episode_time()
     test_score_events_dominate_dense_rewards_and_reset_episode_timer()
+    test_default_architecture_config_preserves_existing_shape()
+    test_custom_architecture_config_controls_hidden_cloud_and_edges()
     print("reward smoke ok")
