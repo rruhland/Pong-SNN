@@ -55,6 +55,8 @@ const viewer = {
   streams: null,
   latestAction: null,
   worldRunner: null,
+  hiddenCloud: null,
+  predictionView: null,
 };
 
 function resize() {
@@ -221,6 +223,8 @@ function acceptState(rawState, source) {
   if (isNewSession || isResetState) {
     viewer.eventTrail = [];
     viewer.lastTrailKey = null;
+    viewer.hiddenCloud = null;
+    viewer.predictionView = null;
   }
   rememberEventCamera(state);
   window.__pongViewerState = state;
@@ -368,6 +372,177 @@ function drawActivityGrid(ctx, activeIndices, grid, x, y, width, height, color) 
   }
 }
 
+function stableNoise(index) {
+  const value = Math.sin(index * 12.9898 + 78.233) * 43758.5453;
+  return value - Math.floor(value);
+}
+
+function ensureFloatGrid(existing, width, height) {
+  const size = width * height;
+  if (existing && existing.width === width && existing.height === height && existing.activity?.length === size) {
+    return existing;
+  }
+  return {
+    width,
+    height,
+    activity: new Float32Array(size),
+    memory: new Float32Array(size),
+    lastAt: performance.now(),
+  };
+}
+
+function decayGrid(grid, now, fastHalfLifeMs, memoryHalfLifeMs) {
+  const elapsed = Math.max(0, Math.min(500, now - (grid.lastAt || now)));
+  const fastDecay = Math.pow(0.5, elapsed / fastHalfLifeMs);
+  const memoryDecay = Math.pow(0.5, elapsed / memoryHalfLifeMs);
+  for (let index = 0; index < grid.activity.length; index += 1) {
+    grid.activity[index] *= fastDecay;
+    grid.memory[index] *= memoryDecay;
+  }
+  grid.lastAt = now;
+}
+
+function addGridValue(values, width, height, x, y, amount, radius = 1.2) {
+  const minX = Math.max(0, Math.floor(x - radius * 2));
+  const maxX = Math.min(width - 1, Math.ceil(x + radius * 2));
+  const minY = Math.max(0, Math.floor(y - radius * 2));
+  const maxY = Math.min(height - 1, Math.ceil(y + radius * 2));
+  const denom = Math.max(0.001, radius * radius);
+  for (let row = minY; row <= maxY; row += 1) {
+    for (let col = minX; col <= maxX; col += 1) {
+      const distanceSq = (col - x) * (col - x) + (row - y) * (row - y);
+      const weight = Math.exp(-distanceSq / denom);
+      const index = row * width + col;
+      values[index] = Math.min(1, values[index] + amount * weight);
+    }
+  }
+}
+
+function activeInputIndices(architecture, activity) {
+  const input = architecture?.input;
+  if (!input?.width || !input?.height) return activity?.activeInputSample || [];
+  const eventCamera = viewer.latestState?.eventCamera;
+  if (eventCamera?.pixels?.length) {
+    const cells = new Set();
+    for (const pixel of eventCamera.pixels) {
+      const sourceX = pixel % eventCamera.width;
+      const sourceY = Math.floor(pixel / eventCamera.width);
+      const cellX = Math.max(0, Math.min(input.width - 1, Math.floor((sourceX / eventCamera.width) * input.width)));
+      const cellY = Math.max(0, Math.min(input.height - 1, Math.floor((sourceY / eventCamera.height) * input.height)));
+      cells.add(cellY * input.width + cellX);
+      if (cells.size >= 900) break;
+    }
+    return [...cells];
+  }
+  return activity?.activeInputSample || [];
+}
+
+function predictionIndices(activity, status) {
+  const current = activity?.activeHidden3;
+  if (Array.isArray(current) && current.length) return current;
+  const sample = activity?.prediction?.sample || status?.prediction?.sample;
+  return Array.isArray(sample) ? sample : [];
+}
+
+function updateEstimatedHiddenCloud(architecture, activity, inputIndices, predictionSample) {
+  const hiddenLayer = (architecture?.layers || []).find((layer) => layer.name === "hidden1");
+  const width = Math.max(8, Number(hiddenLayer?.width || 24));
+  const height = Math.max(6, Number(hiddenLayer?.height || 15));
+  const input = architecture?.input || { width: 64, height: 36 };
+  const now = performance.now();
+  viewer.hiddenCloud = ensureFloatGrid(viewer.hiddenCloud, width, height);
+  decayGrid(viewer.hiddenCloud, now, 220, 9500);
+
+  const learning = activity?.learning || viewer.snnStatus?.learning || {};
+  const learnedGain = Math.min(1, Math.log10(10 + Number(learning.step || 0)) / 5);
+  for (const index of inputIndices.slice(0, 700)) {
+    const inputX = index % input.width;
+    const inputY = Math.floor(index / input.width);
+    const hiddenX = ((inputX + 0.5) / input.width) * width - 0.5;
+    const hiddenY = ((inputY + 0.5) / input.height) * height - 0.5;
+    addGridValue(viewer.hiddenCloud.activity, width, height, hiddenX, hiddenY, 0.36, 1.25);
+    addGridValue(viewer.hiddenCloud.memory, width, height, hiddenX, hiddenY, 0.006 + learnedGain * 0.01, 1.75);
+  }
+
+  for (const index of predictionSample.slice(0, 220)) {
+    const inputX = index % input.width;
+    const inputY = Math.floor(index / input.width);
+    const hiddenX = ((inputX + 0.5) / input.width) * width - 0.5;
+    const hiddenY = ((inputY + 0.5) / input.height) * height - 0.5;
+    addGridValue(viewer.hiddenCloud.memory, width, height, hiddenX, hiddenY, 0.0035 + learnedGain * 0.003, 2.3);
+  }
+
+  return viewer.hiddenCloud;
+}
+
+function updatePredictionView(architecture, predictionSample) {
+  const input = architecture?.input || { width: 64, height: 36 };
+  const width = Math.max(1, Number(input.width || 64));
+  const height = Math.max(1, Number(input.height || 36));
+  const now = performance.now();
+  viewer.predictionView = ensureFloatGrid(viewer.predictionView, width, height);
+  decayGrid(viewer.predictionView, now, 260, 14000);
+  for (const index of predictionSample.slice(0, 900)) {
+    if (index < 0 || index >= width * height) continue;
+    viewer.predictionView.activity[index] = Math.min(1, viewer.predictionView.activity[index] + 0.72);
+    viewer.predictionView.memory[index] = Math.min(1, viewer.predictionView.memory[index] + 0.018);
+  }
+  return viewer.predictionView;
+}
+
+function drawHeatGrid(ctx, gridState, x, y, width, height, palette) {
+  if (!gridState) return;
+  const cellW = width / gridState.width;
+  const cellH = height / gridState.height;
+  for (let index = 0; index < gridState.activity.length; index += 1) {
+    const value = Math.max(gridState.activity[index], gridState.memory[index] * 0.7);
+    if (value < 0.015) continue;
+    const col = index % gridState.width;
+    const row = Math.floor(index / gridState.width);
+    const alpha = Math.min(0.88, 0.1 + value * 0.78);
+    ctx.fillStyle = palette(alpha, value, index);
+    ctx.fillRect(x + col * cellW, y + row * cellH, Math.max(1.2, cellW), Math.max(1.2, cellH));
+  }
+}
+
+function drawEstimatedCloud(ctx, cloud, x, y, width, height) {
+  if (!cloud) return;
+  const cellW = width / cloud.width;
+  const cellH = height / cloud.height;
+  for (let index = 0; index < cloud.activity.length; index += 1) {
+    const value = Math.max(cloud.activity[index], cloud.memory[index] * 0.78);
+    if (value < 0.018) continue;
+    const col = index % cloud.width;
+    const row = Math.floor(index / cloud.width);
+    const jitterX = (stableNoise(index) - 0.5) * cellW * 0.45;
+    const jitterY = (stableNoise(index + 99) - 0.5) * cellH * 0.45;
+    const size = Math.max(2, Math.min(cellW, cellH) * (0.42 + value * 0.55));
+    const alpha = Math.min(0.9, 0.12 + value * 0.82);
+    ctx.fillStyle = `rgba(31, 111, 235, ${alpha.toFixed(3)})`;
+    ctx.fillRect(
+      x + (col + 0.5) * cellW + jitterX - size / 2,
+      y + (row + 0.5) * cellH + jitterY - size / 2,
+      size,
+      size
+    );
+  }
+}
+
+function drawNetworkPanelFrame(ctx, box) {
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(box.x, box.y, box.width, box.height);
+  ctx.strokeStyle = "#111";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(box.x, box.y, box.width, box.height);
+}
+
+function drawNetworkLabel(ctx, text, box, offset = 14) {
+  ctx.fillStyle = "#111";
+  ctx.font = "12px Arial";
+  ctx.textAlign = "center";
+  ctx.fillText(text, box.x + box.width / 2, box.y + box.height + offset);
+}
+
 function drawNetworkDesign() {
   if (!networkCanvas || !networkCtx) return;
   const width = networkCanvas.clientWidth;
@@ -389,43 +564,36 @@ function drawNetworkDesign() {
     return;
   }
 
-  const layers = [
-    { label: "input", width: architecture.input.width, height: architecture.input.height, active: activity.activeInputSample || [] },
-    ...(architecture.layers || []).map((layer) => ({
-      label: layer.name,
-      width: layer.width,
-      height: layer.height,
-      active:
-        layer.name === "hidden1"
-          ? activity.activeHidden1
-          : layer.name === "hidden2"
-            ? activity.activeHidden2
-            : layer.name === "hidden3"
-              ? activity.activeHidden3
-              : [],
-      layer,
-    })),
-  ];
+  const input = architecture.input || { width: 64, height: 36 };
+  const inputIndices = activeInputIndices(architecture, activity);
+  const predictionSample = predictionIndices(activity, status);
+  const hiddenCloud = updateEstimatedHiddenCloud(architecture, activity, inputIndices, predictionSample);
+  const predictionView = updatePredictionView(architecture, predictionSample);
 
-  const top = 34;
-  const panelHeight = height - top - 16;
-  const step = width / Math.max(1, layers.length);
-  const boxes = [];
-  for (let index = 0; index < layers.length; index += 1) {
-    const layer = layers[index];
-    const boxW = Math.min(92, step * 0.68);
-    const boxH = Math.min(panelHeight * 0.72, Math.max(28, boxW * (layer.height / Math.max(1, layer.width))));
-    const x = step * index + (step - boxW) / 2;
-    const y = top + (panelHeight - boxH) / 2;
-    boxes.push({ x, y, width: boxW, height: boxH, layer });
-  }
+  const top = 36;
+  const labelSpace = 34;
+  const panelHeight = height - top - labelSpace - 8;
+  const gap = Math.max(18, width * 0.035);
+  const inputAspect = input.height / Math.max(1, input.width);
+  const maxGridW = Math.max(80, (width - gap * 4) * 0.26);
+  const gridW = Math.min(180, maxGridW);
+  const gridH = Math.min(panelHeight * 0.74, Math.max(42, gridW * inputAspect));
+  const cloudW = Math.min(210, Math.max(112, (width - gap * 4) * 0.28));
+  const cloudH = Math.min(panelHeight * 0.82, Math.max(70, cloudW * 0.7));
+  const totalW = gridW + cloudW + gridW + gap * 2;
+  const startX = Math.max(10, (width - totalW) / 2);
+  const centerY = top + panelHeight / 2;
+  const boxes = {
+    input: { x: startX, y: centerY - gridH / 2, width: gridW, height: gridH },
+    cloud: { x: startX + gridW + gap, y: centerY - cloudH / 2, width: cloudW, height: cloudH },
+    prediction: { x: startX + gridW + gap + cloudW + gap, y: centerY - gridH / 2, width: gridW, height: gridH },
+  };
 
   networkCtx.strokeStyle = "rgba(17,17,17,0.42)";
   networkCtx.lineWidth = 1;
-  for (let index = 0; index < boxes.length - 1; index += 1) {
-    const from = boxes[index];
-    const to = boxes[index + 1];
-    const lines = index === 0 ? 7 : 5;
+  for (const pair of [[boxes.input, boxes.cloud], [boxes.cloud, boxes.prediction]]) {
+    const [from, to] = pair;
+    const lines = 9;
     for (let line = 0; line < lines; line += 1) {
       const fromY = from.y + ((line + 1) / (lines + 1)) * from.height;
       const toY = to.y + ((line + 1) / (lines + 1)) * to.height;
@@ -436,21 +604,44 @@ function drawNetworkDesign() {
     }
   }
 
-  for (const box of boxes) {
-    networkCtx.fillStyle = "#fff";
-    networkCtx.fillRect(box.x, box.y, box.width, box.height);
-    networkCtx.strokeStyle = "#111";
-    networkCtx.lineWidth = 2;
-    networkCtx.strokeRect(box.x, box.y, box.width, box.height);
-    drawActivityGrid(networkCtx, box.layer.active, box.layer, box.x, box.y, box.width, box.height, "#e31b2f");
-    networkCtx.fillStyle = "#111";
-    networkCtx.font = "12px Arial";
-    networkCtx.textAlign = "center";
-    networkCtx.fillText(box.layer.label, box.x + box.width / 2, box.y + box.height + 14);
-    if (box.layer.layer?.receptiveField) {
-      networkCtx.font = "10px Arial";
-      networkCtx.fillText(box.layer.layer.receptiveField, box.x + box.width / 2, box.y + box.height + 27);
+  drawNetworkPanelFrame(networkCtx, boxes.input);
+  drawActivityGrid(networkCtx, inputIndices, input, boxes.input.x, boxes.input.y, boxes.input.width, boxes.input.height, "#e31b2f");
+  drawNetworkLabel(networkCtx, "input events", boxes.input);
+
+  drawNetworkPanelFrame(networkCtx, boxes.cloud);
+  networkCtx.fillStyle = "rgba(31, 111, 235, 0.055)";
+  networkCtx.fillRect(boxes.cloud.x, boxes.cloud.y, boxes.cloud.width, boxes.cloud.height);
+  drawEstimatedCloud(networkCtx, hiddenCloud, boxes.cloud.x + 6, boxes.cloud.y + 6, boxes.cloud.width - 12, boxes.cloud.height - 12);
+  drawNetworkLabel(networkCtx, "estimated hidden cloud", boxes.cloud);
+  networkCtx.font = "10px Arial";
+  networkCtx.fillStyle = "#111";
+  networkCtx.textAlign = "center";
+  networkCtx.fillText("input-shaped trace memory", boxes.cloud.x + boxes.cloud.width / 2, boxes.cloud.y + boxes.cloud.height + 27);
+
+  drawNetworkPanelFrame(networkCtx, boxes.prediction);
+  drawHeatGrid(
+    networkCtx,
+    predictionView,
+    boxes.prediction.x,
+    boxes.prediction.y,
+    boxes.prediction.width,
+    boxes.prediction.height,
+    (alpha, value) => {
+      const green = Math.round(95 + value * 110);
+      return `rgba(22, ${green}, 118, ${alpha.toFixed(3)})`;
     }
+  );
+  drawNetworkLabel(networkCtx, "predicted next events", boxes.prediction);
+  if (status?.prediction) {
+    const stats = status.prediction;
+    networkCtx.font = "10px Arial";
+    networkCtx.fillStyle = "#111";
+    networkCtx.textAlign = "center";
+    networkCtx.fillText(
+      `hits ${stats.hits || 0} / misses ${stats.misses || 0} / mae ${Number(stats.meanAbsError || 0).toFixed(3)}`,
+      boxes.prediction.x + boxes.prediction.width / 2,
+      boxes.prediction.y + boxes.prediction.height + 27
+    );
   }
   networkCtx.textAlign = "left";
 }
