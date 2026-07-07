@@ -34,19 +34,19 @@ SNN_ARCHITECTURE = {
     "hidden_grid_width": 100,
     "hidden_grid_height": None,
     "excitatory_fraction": 0.8,
-    "input_hidden_targets_per_cell": 24,
+    "input_hidden_targets_per_cell": 12,
     "input_hidden_sigma_x": 3.4,
     "input_hidden_sigma_y": 2.4,
     "input_hidden_attempt_multiplier": 8,
-    "motor_hidden_targets_per_action": 420,
-    "motor_hidden_sigma_y_fraction": 0.18,
+    "motor_hidden_targets_per_action": 350,
+    "motor_hidden_sigma_y_fraction": 0.1,
     "recurrent_local_edges_per_neuron": 18,
     "recurrent_long_range_edges_per_neuron": 6,
     "recurrent_local_sigma_x": 3.2,
     "recurrent_local_sigma_y": 2.1,
     "output_targets_per_hidden": 1,
     "prediction_local_targets": 20,
-    "prediction_medium_targets": 4,
+    "prediction_medium_targets": 8,
     "prediction_long_targets": 2,
     "prediction_local_sigma_x": 2.2,
     "prediction_local_sigma_y": 1.8,
@@ -404,7 +404,7 @@ class PongSNN:
         self.excitatory_count = int(self.hidden_size * excitatory_fraction)
         self.inhibitory_count = self.hidden_size - self.excitatory_count
 
-        self.learning_rate = 0.0045
+        self.learning_rate = 0.015 #default=0.0045
         self.prediction_learning_rate = 0.018
         self.prediction_pathway_learning_rate = 0.0028
         self.reward_recurrent_learning_rate = 0.0012
