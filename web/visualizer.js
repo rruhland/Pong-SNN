@@ -438,8 +438,8 @@ function activeInputIndices(architecture, activity) {
 }
 
 function predictionIndices(activity, status) {
-  const current = activity?.activeHidden3;
-  if (Array.isArray(current) && current.length) return current;
+  // The backend's prediction.sample is the same thresholded set used for
+  // hits/misses stats: predicted cells with probability >= 0.32.
   const sample = activity?.prediction?.sample || status?.prediction?.sample;
   return Array.isArray(sample) ? sample : [];
 }
@@ -479,13 +479,12 @@ function updatePredictionView(architecture, predictionSample) {
   const input = architecture?.input || { width: 64, height: 36 };
   const width = Math.max(1, Number(input.width || 64));
   const height = Math.max(1, Number(input.height || 36));
-  const now = performance.now();
   viewer.predictionView = ensureFloatGrid(viewer.predictionView, width, height);
-  decayGrid(viewer.predictionView, now, 260, 14000);
+  viewer.predictionView.activity.fill(0);
+  viewer.predictionView.memory.fill(0);
   for (const index of predictionSample.slice(0, 900)) {
     if (index < 0 || index >= width * height) continue;
-    viewer.predictionView.activity[index] = Math.min(1, viewer.predictionView.activity[index] + 0.72);
-    viewer.predictionView.memory[index] = Math.min(1, viewer.predictionView.memory[index] + 0.018);
+    viewer.predictionView.activity[index] = 1;
   }
   return viewer.predictionView;
 }
