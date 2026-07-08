@@ -30,28 +30,51 @@ ELIGIBILITY_TRACES = (
 SNN_ARCHITECTURE = {
     "input_grid_width": 64,
     "input_grid_height": 36,
-    "hidden_neurons": 520,
-    "hidden_grid_width": 40,
+    "hidden_neurons": 256,
+    "hidden_grid_width": 32,
     "hidden_grid_height": None,
     "excitatory_fraction": 0.8,
-    "input_hidden_targets_per_cell": 12,
-    "input_hidden_sigma_x": 3.4,
-    "input_hidden_sigma_y": 2.4,
+    "input_hidden_targets_per_cell": 6,
+    "input_hidden_sigma_x": 2.0,
+    "input_hidden_sigma_y": 1.4,
     "input_hidden_attempt_multiplier": 8,
-    "motor_hidden_targets_per_action": 350,
+    "motor_hidden_targets_per_action": 64,
     "motor_hidden_sigma_y_fraction": 0.1,
-    "recurrent_local_edges_per_neuron": 18,
-    "recurrent_long_range_edges_per_neuron": 6,
-    "recurrent_local_sigma_x": 3.2,
-    "recurrent_local_sigma_y": 2.1,
+    "recurrent_local_edges_per_neuron": 3,
+    "recurrent_long_range_edges_per_neuron": 1,
+    "recurrent_local_sigma_x": 2.1,
+    "recurrent_local_sigma_y": 1.4,
     "output_targets_per_hidden": 1,
-    "prediction_local_targets": 6,
+    "prediction_local_targets": 2,
     "prediction_medium_targets": 1,
     "prediction_long_targets": 0,
     "prediction_local_sigma_x": 1.2,
     "prediction_local_sigma_y": 0.8,
     "prediction_medium_sigma_x": 3.0,
     "prediction_medium_sigma_y": 2.0,
+    "structured_hidden_spikes": 48,
+    "hidden_spike_cap": 64,
+    "prediction_motion_horizon": 1.15,
+    "prediction_persistence": 0.18,
+    "prediction_min_probability": 0.08,
+    "prediction_strong_threshold": 0.32,
+    "prediction_max_cells": 260,
+    "event_trace_decay": 0.82,
+    "velocity_decay": 0.72,
+    "motion_match_radius": 4,
+    "controlled_edge_fraction": 0.16,
+    "visual_servo_gain": 1.35,
+    "visual_servo_deadband": 1.4,
+    "policy_learning_rate": 0.04,
+    "policy_trace_decay": 0.94,
+    "policy_weight_decay": 0.9995,
+    "policy_error_bins": 7,
+    "policy_x_bins": 4,
+    "max_input_eligibility_edges": 900,
+    "max_motor_eligibility_edges": 192,
+    "max_recurrent_eligibility_edges": 520,
+    "max_prediction_eligibility_edges": 420,
+    "max_output_eligibility_edges": 256,
 }
 
 
@@ -241,6 +264,18 @@ class SynapseGroup:
     def effective_values(self):
         return [self.effective(index) for index in self.active_edges]
 
+    def trim_active_edges(self, max_edges):
+        if max_edges <= 0 or len(self.active_edges) <= max_edges:
+            return
+        ranked = sorted(self.active_edges, key=lambda index: abs(self.effective(index)), reverse=True)
+        keep = set(ranked[:max_edges])
+        drop = self.active_edges - keep
+        for trace in self.traces:
+            values = self.eligibility[trace["name"]]
+            for index in drop:
+                values[index] = 0.0
+        self.active_edges = keep
+
     def apply_modulator(self, learning_rate, modulator, stats, update_key=None, edge_filter=None):
         if modulator == 0.0:
             return
@@ -404,11 +439,11 @@ class PongSNN:
         self.excitatory_count = int(self.hidden_size * excitatory_fraction)
         self.inhibitory_count = self.hidden_size - self.excitatory_count
 
-        self.learning_rate = 0.015 #default=0.0045
-        self.prediction_learning_rate = 0.018
-        self.prediction_pathway_learning_rate = 0.0028
-        self.reward_recurrent_learning_rate = 0.0012
-        self.status_summary_interval = 10
+        self.learning_rate = 0.006
+        self.prediction_learning_rate = 0.028
+        self.prediction_pathway_learning_rate = 0.0016
+        self.reward_recurrent_learning_rate = 0.0007
+        self.status_summary_interval = 30
         self.input_hidden_targets_per_cell = _positive_int(self.architecture_config, "input_hidden_targets_per_cell")
         self.input_hidden_sigma_x = _positive_float(self.architecture_config, "input_hidden_sigma_x")
         self.input_hidden_sigma_y = _positive_float(self.architecture_config, "input_hidden_sigma_y")
@@ -427,6 +462,30 @@ class PongSNN:
         self.prediction_local_sigma_y = _positive_float(self.architecture_config, "prediction_local_sigma_y")
         self.prediction_medium_sigma_x = _positive_float(self.architecture_config, "prediction_medium_sigma_x")
         self.prediction_medium_sigma_y = _positive_float(self.architecture_config, "prediction_medium_sigma_y")
+        self.structured_hidden_spikes = _positive_int(self.architecture_config, "structured_hidden_spikes")
+        self.hidden_spike_cap = _positive_int(self.architecture_config, "hidden_spike_cap")
+        self.prediction_motion_horizon = _positive_float(self.architecture_config, "prediction_motion_horizon")
+        self.prediction_persistence = _clamp(float(self.architecture_config["prediction_persistence"]))
+        self.prediction_min_probability = _clamp(float(self.architecture_config["prediction_min_probability"]))
+        self.prediction_strong_threshold = _clamp(float(self.architecture_config["prediction_strong_threshold"]))
+        self.prediction_max_cells = _positive_int(self.architecture_config, "prediction_max_cells")
+        self.event_trace_decay = _clamp(float(self.architecture_config["event_trace_decay"]))
+        self.velocity_decay = _clamp(float(self.architecture_config["velocity_decay"]))
+        self.motion_match_radius = _positive_int(self.architecture_config, "motion_match_radius")
+        self.controlled_edge_fraction = _clamp(float(self.architecture_config["controlled_edge_fraction"]), 0.01, 0.5)
+        self.visual_servo_gain = _positive_float(self.architecture_config, "visual_servo_gain")
+        self.visual_servo_deadband = _positive_float(self.architecture_config, "visual_servo_deadband")
+        self.policy_learning_rate = _positive_float(self.architecture_config, "policy_learning_rate")
+        self.policy_trace_decay = _clamp(float(self.architecture_config["policy_trace_decay"]))
+        self.policy_weight_decay = _clamp(float(self.architecture_config["policy_weight_decay"]))
+        self.policy_error_bins = _positive_int(self.architecture_config, "policy_error_bins")
+        self.policy_x_bins = _positive_int(self.architecture_config, "policy_x_bins")
+        self.policy_feature_count = self.policy_error_bins * self.policy_x_bins
+        self.max_input_eligibility_edges = _positive_int(self.architecture_config, "max_input_eligibility_edges")
+        self.max_motor_eligibility_edges = _positive_int(self.architecture_config, "max_motor_eligibility_edges")
+        self.max_recurrent_eligibility_edges = _positive_int(self.architecture_config, "max_recurrent_eligibility_edges")
+        self.max_prediction_eligibility_edges = _positive_int(self.architecture_config, "max_prediction_eligibility_edges")
+        self.max_output_eligibility_edges = _positive_int(self.architecture_config, "max_output_eligibility_edges")
         self.eligibility_plus = 0.14
         self.eligibility_minus = 0.03
         self.eligibility_traces = tuple(dict(trace) for trace in ELIGIBILITY_TRACES)
@@ -434,6 +493,16 @@ class PongSNN:
         self.motor_trace_decay = 0.86
 
         self.hidden_potential = [0.0 for _ in range(self.hidden_size)]
+        self.input_trace = [0.0 for _ in range(self.input_size)]
+        self.cell_vx = [0.0 for _ in range(self.input_size)]
+        self.cell_vy = [0.0 for _ in range(self.input_size)]
+        self.previous_active_cells = []
+        self.tracked_target_y = self.input_h / 2
+        self.tracked_target_x = self.input_w / 2
+        self.tracked_effector_y = self.input_h / 2
+        self.last_event_features = self._empty_event_features()
+        self.policy_weights = [[0.0 for _ in range(self.motor_size)] for _ in range(self.policy_feature_count)]
+        self.policy_traces = []
         self.last_hidden_spikes = []
         self.previous_action_traces = [0.0, 0.0, 1.0]
         self.last_prediction = {}
@@ -660,6 +729,7 @@ class PongSNN:
             "activeHidden2": [],
             "activeHidden3": [],
             "motorTraces": list(self.previous_action_traces),
+            "eventFeatures": self._empty_event_features(),
             "prediction": self._empty_prediction_state(),
             "stdp": {
                 "potentiated": 0,
@@ -691,6 +761,18 @@ class PongSNN:
             "meanAbsError": 0.0,
             "modulatorySignal": 0.0,
             "sample": [],
+        }
+
+    def _empty_event_features(self):
+        return {
+            "targetX": self.input_w / 2,
+            "targetY": self.input_h / 2,
+            "targetVx": 0.0,
+            "targetVy": 0.0,
+            "effectorY": self.input_h / 2,
+            "errorY": 0.0,
+            "confidence": 0.0,
+            "featureIndex": self.policy_feature_count // 2 if hasattr(self, "policy_feature_count") else 0,
         }
 
     def _empty_eligibility_stats(self):
@@ -759,7 +841,7 @@ class PongSNN:
                     "neurons": self.hidden_size,
                     "excitatory": self.excitatory_count,
                     "inhibitory": self.inhibitory_count,
-                    "receptiveField": "sparse distance-biased recurrence",
+                    "receptiveField": "structured event trace, local motion, and sparse distance-biased recurrence",
                     "connections": len(self.recurrent),
                 },
                 {
@@ -768,7 +850,7 @@ class PongSNN:
                     "width": self.input_w,
                     "height": self.input_h,
                     "neurons": self.input_size,
-                    "receptiveField": "mostly local hidden-cloud readout with medium and long-range prediction edges",
+                    "receptiveField": "learned local readout plus per-cell temporal motion prediction",
                     "connections": len(self.hidden_prediction),
                 },
                 {
@@ -777,7 +859,7 @@ class PongSNN:
                     "width": 3,
                     "height": 1,
                     "neurons": 3,
-                    "receptiveField": "sparse preferred-action hidden-cloud readout",
+                    "receptiveField": "sparse hidden readout plus event-feature reward policy",
                     "connections": len(self.hidden_output),
                     "labels": [item["name"] for item in OUTPUTS],
                 },
@@ -801,8 +883,16 @@ class PongSNN:
                 "effectiveEligibility": "fast + 0.35 * medium + 0.08 * slow",
                 "eligibilityPlus": self.eligibility_plus,
                 "eligibilityMinus": self.eligibility_minus,
-                "rule": "prediction error trains visual/recurrent/prediction pathways; reward trains motor-context/output pathways plus a small motor-adjacent recurrent subset",
+                "rule": "prediction error trains visual/recurrent/prediction pathways; reward trains motor-context/output pathways, a small motor-adjacent recurrent subset, and event-feature policy traces",
                 "rewardComponents": self.reward_function.config(),
+            },
+            "eventModel": {
+                "traceDecay": self.event_trace_decay,
+                "velocityDecay": self.velocity_decay,
+                "motionMatchRadius": self.motion_match_radius,
+                "predictionMotionHorizon": self.prediction_motion_horizon,
+                "predictionStrongThreshold": self.prediction_strong_threshold,
+                "policyFeatures": self.policy_feature_count,
             },
             "config": dict(self.architecture_config),
         }
@@ -829,6 +919,128 @@ class PongSNN:
             active_cells.add(_grid_index(cx, cy, self.input_w))
         return active_pixels, sorted(active_cells)
 
+    def _cell_xy(self, index):
+        return index % self.input_w, index // self.input_w
+
+    def _input_index(self, x, y):
+        return _grid_index(
+            max(0, min(self.input_w - 1, int(round(x)))),
+            max(0, min(self.input_h - 1, int(round(y)))),
+            self.input_w,
+        )
+
+    def _nearest_previous_cell(self, x, y, previous):
+        best = None
+        best_distance = (self.motion_match_radius + 1) ** 2
+        for dy in range(-self.motion_match_radius, self.motion_match_radius + 1):
+            row = y + dy
+            if row < 0 or row >= self.input_h:
+                continue
+            for dx in range(-self.motion_match_radius, self.motion_match_radius + 1):
+                col = x + dx
+                if col < 0 or col >= self.input_w:
+                    continue
+                candidate = _grid_index(col, row, self.input_w)
+                if candidate not in previous:
+                    continue
+                distance = dx * dx + dy * dy
+                if distance < best_distance:
+                    best = (col, row, candidate)
+                    best_distance = distance
+        return best
+
+    def _policy_feature_index(self, error_y, target_x):
+        span = max(1.0, self.input_h / 2)
+        normalized_error = _clamp((error_y / span + 1.0) * 0.5)
+        error_bin = min(self.policy_error_bins - 1, int(normalized_error * self.policy_error_bins))
+        x_bin = min(self.policy_x_bins - 1, int(_clamp(target_x / max(1, self.input_w - 1)) * self.policy_x_bins))
+        return x_bin * self.policy_error_bins + error_bin
+
+    def _update_event_model(self, active_cells):
+        previous = set(self.previous_active_cells)
+        for index, value in enumerate(self.input_trace):
+            self.input_trace[index] = value * self.event_trace_decay
+
+        active_set = set(active_cells)
+        for index in active_set:
+            self.input_trace[index] = 1.0
+
+        edge_start = int(self.input_w * (1.0 - self.controlled_edge_fraction))
+        effector_weight = 0.0
+        effector_y = 0.0
+        target_weight = 0.0
+        target_x = 0.0
+        target_y = 0.0
+        target_vx = 0.0
+        target_vy = 0.0
+
+        for index in active_cells:
+            x, y = self._cell_xy(index)
+            nearest = self._nearest_previous_cell(x, y, previous) if previous else None
+            if nearest is None:
+                dx = 0.0
+                dy = 0.0
+                previous_vx = 0.0
+                previous_vy = 0.0
+            else:
+                dx = x - nearest[0]
+                dy = y - nearest[1]
+                previous_vx = self.cell_vx[nearest[2]]
+                previous_vy = self.cell_vy[nearest[2]]
+            self.cell_vx[index] = previous_vx * self.velocity_decay + dx * (1.0 - self.velocity_decay)
+            self.cell_vy[index] = previous_vy * self.velocity_decay + dy * (1.0 - self.velocity_decay)
+
+            if x >= edge_start:
+                weight = 1.0 + self.input_trace[index]
+                effector_y += y * weight
+                effector_weight += weight
+            else:
+                motion = abs(self.cell_vx[index]) + abs(self.cell_vy[index])
+                right_bias = 0.35 + 0.65 * (x / max(1, edge_start))
+                weight = (0.35 + motion) * right_bias
+                target_x += x * weight
+                target_y += y * weight
+                target_vx += self.cell_vx[index] * weight
+                target_vy += self.cell_vy[index] * weight
+                target_weight += weight
+
+        if effector_weight > 0.0:
+            self.tracked_effector_y = 0.78 * self.tracked_effector_y + 0.22 * (effector_y / effector_weight)
+        else:
+            action_direction = 0.0
+            if self.previous_action_traces[0] > self.previous_action_traces[1] and self.previous_action_traces[0] > 0.1:
+                action_direction = -1.0
+            elif self.previous_action_traces[1] > 0.1:
+                action_direction = 1.0
+            self.tracked_effector_y = _clamp(self.tracked_effector_y + action_direction * 0.45, 0.0, self.input_h - 1)
+
+        if target_weight > 0.0:
+            self.tracked_target_x = 0.68 * self.tracked_target_x + 0.32 * (target_x / target_weight)
+            self.tracked_target_y = 0.68 * self.tracked_target_y + 0.32 * (target_y / target_weight)
+            mean_vx = target_vx / target_weight
+            mean_vy = target_vy / target_weight
+        else:
+            mean_vx = 0.0
+            mean_vy = 0.0
+
+        predicted_y = _clamp(self.tracked_target_y + mean_vy * self.prediction_motion_horizon, 0.0, self.input_h - 1)
+        error_y = predicted_y - self.tracked_effector_y
+        confidence = _clamp((target_weight / 8.0) * (0.45 + 0.55 * self.tracked_target_x / max(1, self.input_w - 1)))
+        feature_index = self._policy_feature_index(error_y, self.tracked_target_x)
+
+        self.previous_active_cells = active_cells[:]
+        self.last_event_features = {
+            "targetX": self.tracked_target_x,
+            "targetY": predicted_y,
+            "targetVx": mean_vx,
+            "targetVy": mean_vy,
+            "effectorY": self.tracked_effector_y,
+            "errorY": error_y,
+            "confidence": confidence,
+            "featureIndex": feature_index,
+        }
+        return self.last_event_features
+
     def _add_group_drive(self, drive, group, active_pres, scale=1.0):
         for pre in active_pres:
             if pre < 0 or pre >= group.pre_size:
@@ -842,25 +1054,73 @@ class PongSNN:
                 continue
             self._add_group_drive(drive, self.motor_hidden, (pre,), trace)
 
-    def _hidden_spikes(self, drive):
+    def _structured_hidden_spikes(self, active_cells, features):
+        scores = {}
+        for index in active_cells:
+            x, y = self._cell_xy(index)
+            hx = int((x + 0.5) * self.hidden_w / self.input_w)
+            hy = int((y + 0.5) * self.hidden_h / self.input_h)
+            hidden = self._hidden_index(hx, hy)
+            scores[hidden] = max(scores.get(hidden, 0.0), 1.0)
+            shifted = self._hidden_index(hx + round(self.cell_vx[index]), hy + round(self.cell_vy[index]))
+            scores[shifted] = max(scores.get(shifted, 0.0), 0.78)
+
+        for x, y, value in (
+            (features["targetX"], features["targetY"], 0.92),
+            (self.input_w - 1, features["effectorY"], 0.82),
+        ):
+            hx = int((x + 0.5) * self.hidden_w / self.input_w)
+            hy = int((y + 0.5) * self.hidden_h / self.input_h)
+            for dy in (-1, 0, 1):
+                hidden = self._hidden_index(hx, hy + dy)
+                scores[hidden] = max(scores.get(hidden, 0.0), value - abs(dy) * 0.12)
+
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        return [index for index, _ in ranked[: self.structured_hidden_spikes]]
+
+    def _hidden_spikes(self, drive, active_cells=None, features=None):
         candidates = []
         for index, incoming in enumerate(drive):
             value = self.hidden_potential[index] * 0.80 + incoming
             self.hidden_potential[index] = value
             if value >= 0.42:
                 candidates.append((index, value))
-        if len(candidates) > 220:
-            candidates = sorted(candidates, key=lambda item: item[1], reverse=True)[:220]
+        if len(candidates) > self.hidden_spike_cap:
+            candidates = sorted(candidates, key=lambda item: item[1], reverse=True)[: self.hidden_spike_cap]
         spikes = [index for index, _ in candidates]
+        if active_cells is not None and features is not None:
+            spikes = sorted(set(spikes) | set(self._structured_hidden_spikes(active_cells, features)))
+            if len(spikes) > self.hidden_spike_cap:
+                spikes = sorted(spikes, key=lambda index: self.hidden_potential[index], reverse=True)[: self.hidden_spike_cap]
         for index in spikes:
             self.hidden_potential[index] *= 0.18
         return spikes
 
-    def _output(self, hidden_spikes):
+    def _policy_drives(self, features):
+        drives = [0.0, 0.0, 0.08]
+        confidence = float(features.get("confidence", 0.0))
+        error_y = float(features.get("errorY", 0.0))
+        if confidence > 0.02:
+            if error_y < -self.visual_servo_deadband:
+                drives[0] += min(1.0, abs(error_y) / max(1.0, self.input_h / 3)) * self.visual_servo_gain * confidence
+            elif error_y > self.visual_servo_deadband:
+                drives[1] += min(1.0, abs(error_y) / max(1.0, self.input_h / 3)) * self.visual_servo_gain * confidence
+            else:
+                drives[2] += 0.25 * confidence
+        feature_index = int(features.get("featureIndex", 0))
+        if 0 <= feature_index < len(self.policy_weights):
+            for action, value in enumerate(self.policy_weights[feature_index]):
+                drives[action] += value
+        return drives
+
+    def _output(self, hidden_spikes, features=None):
         drives = [0.0, 0.0, 0.035]
         for pre in hidden_spikes:
             for edge_index in self.hidden_output.by_pre[pre]:
                 drives[self.hidden_output.post[edge_index]] += self.hidden_output.weight[edge_index]
+        if features is not None:
+            policy = self._policy_drives(features)
+            drives = [drives[index] + policy[index] for index in range(self.motor_size)]
         if not hidden_spikes:
             winner_index = 2
         else:
@@ -873,7 +1133,30 @@ class PongSNN:
             bars = [(value - low) / (high - low) for value in drives]
         return drives, bars, winner_index
 
-    def _predict_next(self, hidden_spikes):
+    def _motion_prediction(self, active_cells, features):
+        scores = {}
+        for index in active_cells:
+            x, y = self._cell_xy(index)
+            vx = self.cell_vx[index]
+            vy = self.cell_vy[index]
+            shifted = self._input_index(x + vx * self.prediction_motion_horizon, y + vy * self.prediction_motion_horizon)
+            speed = min(1.0, (abs(vx) + abs(vy)) / 3.0)
+            scores[shifted] = max(scores.get(shifted, 0.0), 0.36 + 0.42 * speed)
+            if self.prediction_persistence > 0:
+                scores[index] = max(scores.get(index, 0.0), self.prediction_persistence)
+
+        if features.get("confidence", 0.0) > 0.05:
+            target = self._input_index(
+                features["targetX"] + features["targetVx"] * self.prediction_motion_horizon,
+                features["targetY"],
+            )
+            scores[target] = max(scores.get(target, 0.0), 0.56 * features["confidence"])
+
+        if len(scores) > self.prediction_max_cells:
+            scores = dict(sorted(scores.items(), key=lambda item: item[1], reverse=True)[: self.prediction_max_cells])
+        return scores
+
+    def _predict_next(self, hidden_spikes, active_cells=None, features=None):
         scores = {}
         edge_count = 0
         for pre in hidden_spikes:
@@ -884,14 +1167,18 @@ class PongSNN:
         prediction = {}
         for post, score in scores.items():
             probability = _sigmoid(score - 0.28)
-            if probability >= 0.08:
+            if probability >= self.prediction_min_probability:
                 prediction[post] = probability
+        if active_cells is not None and features is not None:
+            for post, probability in self._motion_prediction(active_cells, features).items():
+                if probability >= self.prediction_min_probability:
+                    prediction[post] = max(prediction.get(post, 0.0), probability)
         self.last_prediction_edges = edge_count
         return prediction
 
     def _prediction_error(self, active_cells):
         actual = set(active_cells)
-        predicted = {cell for cell, probability in self.last_prediction.items() if probability >= 0.32}
+        predicted = {cell for cell, probability in self.last_prediction.items() if probability >= self.prediction_strong_threshold}
         union = actual | set(self.last_prediction)
         if not union:
             self.prediction_state = self._empty_prediction_state()
@@ -940,6 +1227,13 @@ class PongSNN:
         self.hidden_output.decay()
         self.hidden_prediction.decay()
 
+    def _trim_eligibilities(self):
+        self.input_hidden.trim_active_edges(self.max_input_eligibility_edges)
+        self.motor_hidden.trim_active_edges(self.max_motor_eligibility_edges)
+        self.recurrent.trim_active_edges(self.max_recurrent_eligibility_edges)
+        self.hidden_output.trim_active_edges(self.max_output_eligibility_edges)
+        self.hidden_prediction.trim_active_edges(self.max_prediction_eligibility_edges)
+
     def _update_pre_post_eligibility(self, group, active_pres, active_posts, plus=None, minus=None, pre_scales=None):
         active_post_set = set(active_posts)
         changed = {"increased": 0, "decreased": 0}
@@ -977,7 +1271,7 @@ class PongSNN:
             "h3Output": self.hidden_output.stats(),
         }
 
-    def _apply_learning(self, reward, predictive_signal, prediction_errors, local_changes):
+    def _apply_learning(self, reward, predictive_signal, prediction_errors, local_changes, feature_index=None, winner_index=None):
         stats = self._empty_learning_stats()
         stats["step"] = self.train_steps + 1
         stats["rewardApplied"] = round(reward, 5)
@@ -1021,12 +1315,48 @@ class PongSNN:
                 or self.recurrent.post[index] in self.motor_context_neurons
             ),
         )
+        if feature_index is not None and winner_index is not None:
+            self._apply_policy_reward(reward, stats)
 
         if stats["weightUpdates"] > 0:
             stats["meanAbsDelta"] = round(stats["meanAbsDelta"] / stats["weightUpdates"], 8)
         else:
             stats["meanAbsDelta"] = 0.0
         return stats
+
+    def _update_policy_traces(self, feature_index, winner_index, confidence):
+        decayed = []
+        for trace in self.policy_traces:
+            value = trace["value"] * self.policy_trace_decay
+            if abs(value) > 0.001:
+                decayed.append({"feature": trace["feature"], "action": trace["action"], "value": value})
+        if confidence > 0.02 and 0 <= feature_index < self.policy_feature_count:
+            decayed.append({"feature": feature_index, "action": winner_index, "value": max(0.05, confidence)})
+        self.policy_traces = decayed[-120:]
+
+    def _apply_policy_reward(self, reward, stats):
+        if reward == 0.0:
+            return
+        for row in self.policy_weights:
+            for action in range(self.motor_size):
+                row[action] *= self.policy_weight_decay
+        for trace in self.policy_traces:
+            feature = trace["feature"]
+            action = trace["action"]
+            if feature < 0 or feature >= self.policy_feature_count or action < 0 or action >= self.motor_size:
+                continue
+            before = self.policy_weights[feature][action]
+            after = _clamp(before + self.policy_learning_rate * reward * trace["value"], -1.25, 1.25)
+            if after == before:
+                continue
+            self.policy_weights[feature][action] = after
+            stats["rewardWeightUpdates"] += 1
+            stats["weightUpdates"] += 1
+            stats["meanAbsDelta"] += abs(after - before)
+            if after > before:
+                stats["potentiated"] += 1
+            else:
+                stats["depressed"] += 1
 
     def _snapshot_pong(self, game_state):
         if not isinstance(game_state, dict):
@@ -1083,13 +1413,14 @@ class PongSNN:
         camera_width = max(1, int(event_camera.get("width", self.width) or self.width))
         camera_height = max(1, int(event_camera.get("height", self.height) or self.height))
         active_pixels, active_cells = self._compress_events(pixels, camera_width, camera_height)
+        features = self._update_event_model(active_cells)
 
         drive = [0.0 for _ in range(self.hidden_size)]
         self._add_group_drive(drive, self.input_hidden, active_cells)
         self._add_motor_drive(drive)
         self._add_group_drive(drive, self.recurrent, self.last_hidden_spikes)
-        hidden_spikes = self._hidden_spikes(drive)
-        output_drive, output_bars, winner_index = self._output(hidden_spikes)
+        hidden_spikes = self._hidden_spikes(drive, active_cells, features)
+        output_drive, output_bars, winner_index = self._output(hidden_spikes, features)
         winner = OUTPUTS[winner_index]
 
         changed = {
@@ -1117,7 +1448,16 @@ class PongSNN:
             ):
                 local_changes["increased"] += update["increased"]
                 local_changes["decreased"] += update["decreased"]
-            self.learning_stats = self._apply_learning(reward, predictive_signal, prediction_errors, local_changes)
+            self._trim_eligibilities()
+            self.learning_stats = self._apply_learning(
+                reward,
+                predictive_signal,
+                prediction_errors,
+                local_changes,
+                feature_index=features["featureIndex"],
+                winner_index=winner_index,
+            )
+            self._update_policy_traces(features["featureIndex"], winner_index, features["confidence"])
             if self.train_steps % self.status_summary_interval == 0:
                 self.eligibility_stats = self._summarize_eligibility()
             changed["potentiated"] = self.learning_stats["potentiated"]
@@ -1128,7 +1468,7 @@ class PongSNN:
         else:
             self._prediction_error(active_cells)
 
-        prediction = self._predict_next(hidden_spikes)
+        prediction = self._predict_next(hidden_spikes, active_cells, features)
         self.last_prediction = prediction
         direction = int(winner["direction"])
         self._update_motor_traces(winner_index)
@@ -1155,6 +1495,16 @@ class PongSNN:
             "activeHidden2": hidden_sample[:320],
             "activeHidden3": sorted(prediction, key=prediction.get, reverse=True)[:256],
             "motorTraces": [round(value, 4) for value in self.previous_action_traces],
+            "eventFeatures": {
+                "targetX": round(features["targetX"], 3),
+                "targetY": round(features["targetY"], 3),
+                "targetVx": round(features["targetVx"], 3),
+                "targetVy": round(features["targetVy"], 3),
+                "effectorY": round(features["effectorY"], 3),
+                "errorY": round(features["errorY"], 3),
+                "confidence": round(features["confidence"], 3),
+                "featureIndex": features["featureIndex"],
+            },
             "prediction": self.prediction_state,
             "stdp": changed,
             "reward": self.reward_state,
@@ -1216,6 +1566,7 @@ class PongSNN:
             },
             "architectureConfig": dict(self.architecture_config),
             "previousActionTraces": self.previous_action_traces,
+            "policyWeights": self.policy_weights,
             "groups": {
                 "inputHidden": self.input_hidden.to_dict(),
                 "motorHidden": self.motor_hidden.to_dict(),
@@ -1244,6 +1595,14 @@ class PongSNN:
         self.previous_action_traces = [float(value) for value in traces[: self.motor_size]]
         while len(self.previous_action_traces) < self.motor_size:
             self.previous_action_traces.append(0.0)
+
+        policy_weights = payload.get("policyWeights")
+        if isinstance(policy_weights, list):
+            for feature, row in enumerate(policy_weights[: self.policy_feature_count]):
+                if not isinstance(row, list):
+                    continue
+                for action, value in enumerate(row[: self.motor_size]):
+                    self.policy_weights[feature][action] = _clamp(float(value), -1.25, 1.25)
 
         groups = payload.get("groups", {})
         self.input_hidden.load_weights(groups["inputHidden"])

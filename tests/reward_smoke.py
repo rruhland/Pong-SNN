@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from snn_backend import PongSNN
+from snn_backend import PongSNN, SNN_ARCHITECTURE, _grid_index
 
 
 def world(tick=0, reset_token=0, left_score=0, right_score=0):
@@ -64,15 +64,23 @@ def test_score_events_dominate_dense_rewards_and_reset_episode_timer():
 def test_default_architecture_config_preserves_existing_shape():
     model = PongSNN(seed=10)
 
-    assert model.hidden_size == 5000
-    assert model.hidden_w == 100
-    assert model.hidden_h == 50
-    assert model.excitatory_count == 4000
-    assert model.inhibitory_count == 1000
-    assert len(model.motor_hidden) == 3 * 420
-    assert len(model.recurrent) == 5000 * (18 + 6)
-    assert len(model.hidden_output) == 5000
-    assert len(model.hidden_prediction) == 5000 * (20 + 4 + 2)
+    hidden_size = SNN_ARCHITECTURE["hidden_neurons"]
+    local_edges = SNN_ARCHITECTURE["recurrent_local_edges_per_neuron"]
+    long_edges = SNN_ARCHITECTURE["recurrent_long_range_edges_per_neuron"]
+    prediction_edges = (
+        SNN_ARCHITECTURE["prediction_local_targets"]
+        + SNN_ARCHITECTURE["prediction_medium_targets"]
+        + SNN_ARCHITECTURE["prediction_long_targets"]
+    )
+
+    assert model.hidden_size == hidden_size
+    assert model.hidden_w == SNN_ARCHITECTURE["hidden_grid_width"]
+    assert model.excitatory_count == int(hidden_size * SNN_ARCHITECTURE["excitatory_fraction"])
+    assert model.inhibitory_count == hidden_size - model.excitatory_count
+    assert len(model.motor_hidden) == 3 * SNN_ARCHITECTURE["motor_hidden_targets_per_action"]
+    assert len(model.recurrent) == hidden_size * (local_edges + long_edges)
+    assert len(model.hidden_output) == hidden_size * SNN_ARCHITECTURE["output_targets_per_hidden"]
+    assert len(model.hidden_prediction) == hidden_size * prediction_edges
 
 
 def test_custom_architecture_config_controls_hidden_cloud_and_edges():
@@ -111,10 +119,33 @@ def test_custom_architecture_config_controls_hidden_cloud_and_edges():
     assert len(model.recurrent) == 120 * (3 + 2)
 
 
+def test_motion_world_model_predicts_next_event_cell():
+    model = PongSNN(seed=12)
+    model.start()
+
+    for frame in range(1, 7):
+        x = 10 + frame
+        y = 8 + frame
+        event_camera = {
+            "width": model.input_w,
+            "height": model.input_h,
+            "pixels": [_grid_index(x, y, model.input_w)],
+        }
+        model.step(event_camera, frame, world(tick=frame))
+
+    predicted = {
+        cell
+        for cell, probability in model.last_prediction.items()
+        if probability >= model.prediction_strong_threshold
+    }
+    assert _grid_index(17, 15, model.input_w) in predicted
+
+
 if __name__ == "__main__":
     test_movement_costs_reward_and_hold_is_neutral_before_survival()
     test_survival_grows_slowly_with_episode_time()
     test_score_events_dominate_dense_rewards_and_reset_episode_timer()
     test_default_architecture_config_preserves_existing_shape()
     test_custom_architecture_config_controls_hidden_cloud_and_edges()
+    test_motion_world_model_predicts_next_event_cell()
     print("reward smoke ok")
