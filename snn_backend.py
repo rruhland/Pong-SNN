@@ -30,8 +30,8 @@ ELIGIBILITY_TRACES = (
 SNN_ARCHITECTURE = {
     "input_grid_width": 64,
     "input_grid_height": 36,
-    "hidden_neurons": 500,
-    "hidden_grid_width": 100,
+    "hidden_neurons": 520,
+    "hidden_grid_width": 40,
     "hidden_grid_height": None,
     "excitatory_fraction": 0.8,
     "input_hidden_targets_per_cell": 12,
@@ -45,13 +45,13 @@ SNN_ARCHITECTURE = {
     "recurrent_local_sigma_x": 3.2,
     "recurrent_local_sigma_y": 2.1,
     "output_targets_per_hidden": 1,
-    "prediction_local_targets": 20,
-    "prediction_medium_targets": 8,
-    "prediction_long_targets": 2,
-    "prediction_local_sigma_x": 2.2,
-    "prediction_local_sigma_y": 1.8,
-    "prediction_medium_sigma_x": 7.0,
-    "prediction_medium_sigma_y": 4.4,
+    "prediction_local_targets": 6,
+    "prediction_medium_targets": 1,
+    "prediction_long_targets": 0,
+    "prediction_local_sigma_x": 1.2,
+    "prediction_local_sigma_y": 0.8,
+    "prediction_medium_sigma_x": 3.0,
+    "prediction_medium_sigma_y": 2.0,
 }
 
 
